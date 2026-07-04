@@ -5,4 +5,5 @@
 //! ordering) into the append-only [`trace`] log, ordered by a monotonic
 //! global sequence number.
 
+pub mod capture;
 pub mod trace;
