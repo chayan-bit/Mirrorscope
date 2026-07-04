@@ -5,4 +5,11 @@
 //! (`listCheckpoints`, `taskTimeline`, `jumpToEvent`). This is the only
 //! contract any client — VS Code, nvim-dap, the Workbench — depends on.
 //!
-//! The server skeleton lands with issue #3.
+//! The skeleton serves a static [`stub`] target so clients can attach
+//! before the replay engine exists; `stepBack`/`reverseContinue` are
+//! polite stubs until Phase 1 wires them to `replay` (issue #8).
+
+pub mod protocol;
+pub mod server;
+pub mod stub;
+pub mod transport;
