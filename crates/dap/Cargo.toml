@@ -1,0 +1,15 @@
+[package]
+name = "dap"
+description = "Layer 4: DAP server — reverseContinue/stepBack plus Mirrorscope's custom requests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+replay.workspace = true
+decoder.workspace = true
+
+[lints]
+workspace = true

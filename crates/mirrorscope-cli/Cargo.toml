@@ -1,0 +1,20 @@
+[package]
+name = "mirrorscope-cli"
+description = "Mirrorscope command-line entry point (record / replay / DAP server)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mirrorscope"
+path = "src/main.rs"
+
+[dependencies]
+recorder.workspace = true
+replay.workspace = true
+dap.workspace = true
+
+[lints]
+workspace = true

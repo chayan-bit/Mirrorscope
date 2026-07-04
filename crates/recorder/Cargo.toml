@@ -1,0 +1,15 @@
+[package]
+name = "recorder"
+description = "Layer 1: recording — capture backends and the append-only trace log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+crc32fast.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
