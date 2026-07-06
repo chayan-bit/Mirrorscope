@@ -4,10 +4,75 @@
 pub const MAGIC: [u8; 8] = *b"MSCOPETR";
 
 /// Current format version written by [`super::TraceWriter`].
-pub const FORMAT_VERSION: u16 = 1;
+///
+/// v2 embeds the recorded command line in the header (see [`Cmdline`]) so the
+/// replay engine knows what to re-execute; v1 traces carry none.
+pub const FORMAT_VERSION: u16 = 2;
 
 /// Fixed portion of the header: magic + version + header_len.
 pub(crate) const BASE_HEADER_LEN: usize = 12;
+
+/// First format version whose header can embed a [`Cmdline`].
+pub(crate) const CMDLINE_MIN_VERSION: u16 = 2;
+
+/// The command line a trace was recorded from: the program plus its arguments.
+///
+/// Stored in the variable-length header region of a v2+ trace as length-prefixed
+/// UTF-8, so replay can spawn the exact same target. `None` for v1 traces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cmdline {
+    /// The recorded program (argv[0] as passed to the recorder).
+    pub program: String,
+    /// The recorded arguments following the program.
+    pub args: Vec<String>,
+}
+
+/// Encode a command line for the v2+ header: program, then arg count, then each
+/// arg, every string a `u32` little-endian length prefix followed by UTF-8 bytes.
+pub(crate) fn encode_cmdline(program: &str, args: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_str(&mut out, program);
+    out.extend_from_slice(&(args.len() as u32).to_le_bytes());
+    for arg in args {
+        push_str(&mut out, arg);
+    }
+    out
+}
+
+/// Decode a command line from the header region. Trailing bytes (reserved for
+/// future header fields) are ignored, keeping the header forward-compatible.
+pub(crate) fn decode_cmdline(buf: &[u8]) -> Result<Cmdline, TraceError> {
+    let mut pos = 0usize;
+    let program = read_str(buf, &mut pos)?;
+    let count = read_u32(buf, &mut pos)? as usize;
+    let mut args = Vec::new();
+    for _ in 0..count {
+        args.push(read_str(buf, &mut pos)?);
+    }
+    Ok(Cmdline { program, args })
+}
+
+fn push_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn read_u32(buf: &[u8], pos: &mut usize) -> Result<u32, TraceError> {
+    let end = pos.checked_add(4).ok_or(TraceError::MalformedHeader)?;
+    let slice = buf.get(*pos..end).ok_or(TraceError::MalformedHeader)?;
+    *pos = end;
+    Ok(u32::from_le_bytes(
+        slice.try_into().expect("length checked"),
+    ))
+}
+
+fn read_str(buf: &[u8], pos: &mut usize) -> Result<String, TraceError> {
+    let len = read_u32(buf, pos)? as usize;
+    let end = pos.checked_add(len).ok_or(TraceError::MalformedHeader)?;
+    let slice = buf.get(*pos..end).ok_or(TraceError::MalformedHeader)?;
+    *pos = end;
+    String::from_utf8(slice.to_vec()).map_err(|_| TraceError::MalformedHeader)
+}
 
 /// Body bytes preceding the payload: seq + timestamp_ns + kind.
 pub(crate) const BODY_PREFIX_LEN: usize = 18;
@@ -123,6 +188,9 @@ pub enum TraceError {
     /// The stream ended in the middle of a record frame.
     #[error("trace truncated mid-record")]
     Truncated,
+    /// The header's embedded command line could not be decoded.
+    #[error("malformed trace header (bad embedded command line)")]
+    MalformedHeader,
     /// A record's sequence number did not strictly increase.
     #[error("non-monotonic sequence number {found} after {previous}")]
     NonMonotonicSequence {

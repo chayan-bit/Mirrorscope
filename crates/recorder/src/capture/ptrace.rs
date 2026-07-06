@@ -72,7 +72,7 @@ pub fn record_command(
     trace_path: &Path,
 ) -> Result<RecordOutcome, CaptureError> {
     let file = File::create(trace_path).map_err(TraceError::Io)?;
-    let mut writer = TraceWriter::create(BufWriter::new(file))?;
+    let mut writer = TraceWriter::create_with_cmdline(BufWriter::new(file), program, args)?;
 
     let child = spawn_traced(program, args)?;
     let pid = Pid::from_raw(child.id() as i32);
@@ -91,11 +91,18 @@ pub fn record_command(
 fn spawn_traced(program: &str, args: &[String]) -> Result<std::process::Child, CaptureError> {
     let mut command = Command::new(program);
     command.args(args);
-    // SAFETY: pre_exec runs post-fork/pre-exec in the child; traceme() is
-    // async-signal-safe (a single ptrace syscall) and touches no locks.
+    // SAFETY: pre_exec runs post-fork/pre-exec in the child; personality() and
+    // traceme() are async-signal-safe (single syscalls) and touch no locks.
+    // ADDR_NO_RANDOMIZE pins the address-space layout so record and replay match
+    // (checksum divergence detection #11 and retroactive watchpoints #12).
     #[allow(unsafe_code)]
     unsafe {
-        command.pre_exec(|| ptrace::traceme().map_err(std::io::Error::from));
+        command.pre_exec(|| {
+            if libc::personality(libc::ADDR_NO_RANDOMIZE as _) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            ptrace::traceme().map_err(std::io::Error::from)
+        });
     }
     command.spawn().map_err(CaptureError::Spawn)
 }

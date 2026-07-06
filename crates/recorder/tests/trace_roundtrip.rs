@@ -2,7 +2,7 @@
 //! writer -> reader round-trip, global sequence numbers, checksums,
 //! and forward-compatibility of the header.
 
-use recorder::trace::{Event, EventKind, TraceError, TraceReader, TraceWriter};
+use recorder::trace::{Cmdline, Event, EventKind, TraceError, TraceReader, TraceWriter};
 
 fn fixture_events() -> Vec<Event> {
     vec![
@@ -105,10 +105,58 @@ fn rejects_unsupported_future_version() {
 }
 
 #[test]
+fn round_trips_embedded_cmdline() {
+    let mut writer = TraceWriter::create_with_cmdline(
+        Vec::new(),
+        "head",
+        &["-c".to_owned(), "32".to_owned(), "file".to_owned()],
+    )
+    .expect("create writer");
+    for event in fixture_events() {
+        writer.append(&event).expect("append event");
+    }
+    let bytes = writer.into_inner();
+
+    let reader = TraceReader::open(&bytes[..]).expect("open reader");
+    assert_eq!(
+        reader.cmdline(),
+        Some(&Cmdline {
+            program: "head".to_owned(),
+            args: vec!["-c".to_owned(), "32".to_owned(), "file".to_owned()],
+        })
+    );
+    let records: Vec<_> = reader.map(|r| r.expect("valid record")).collect();
+    assert_eq!(records.len(), fixture_events().len());
+}
+
+#[test]
+fn reads_v1_trace_without_a_cmdline() {
+    // Forge a v1 trace (no embedded cmdline) by writing a header-less v2 trace
+    // and stamping the version field back to 1: readers must still parse it and
+    // report no cmdline.
+    let mut writer = TraceWriter::create(Vec::new()).expect("create writer");
+    for event in fixture_events() {
+        writer.append(&event).expect("append event");
+    }
+    let mut bytes = writer.into_inner();
+    bytes[8..10].copy_from_slice(&1u16.to_le_bytes());
+
+    let reader = TraceReader::open(&bytes[..]).expect("open reader");
+    assert_eq!(reader.cmdline(), None, "v1 traces carry no command line");
+    let records: Vec<_> = reader.map(|r| r.expect("valid record")).collect();
+    assert_eq!(records.len(), fixture_events().len());
+}
+
+#[test]
 fn skips_reserved_header_bytes_from_newer_minor_writers() {
-    // A future writer may enlarge the header; readers must honor the
-    // header-length field and skip bytes they do not understand.
-    let bytes = write_fixture();
+    // A future writer may enlarge the header after the cmdline; readers must
+    // honor the header-length field and skip bytes they do not understand.
+    let mut writer =
+        TraceWriter::create_with_cmdline(Vec::new(), "true", &[]).expect("create writer");
+    for event in fixture_events() {
+        writer.append(&event).expect("append event");
+    }
+    let bytes = writer.into_inner();
     let header_len = u16::from_le_bytes([bytes[10], bytes[11]]) as usize;
 
     let mut extended = bytes[..header_len].to_vec();
@@ -118,6 +166,11 @@ fn skips_reserved_header_bytes_from_newer_minor_writers() {
     extended.extend_from_slice(&bytes[header_len..]);
 
     let reader = TraceReader::open(&extended[..]).expect("open reader");
+    assert_eq!(
+        reader.cmdline().map(|c| c.program.as_str()),
+        Some("true"),
+        "cmdline must survive trailing reserved header bytes"
+    );
     let records: Vec<_> = reader.map(|r| r.expect("valid record")).collect();
     assert_eq!(records.len(), fixture_events().len());
 }
