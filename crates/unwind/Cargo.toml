@@ -1,0 +1,17 @@
+[package]
+name = "unwind"
+description = "Layer 5: DWARF stack unwinding (framehop) + symbolization (addr2line) over abstract memory access"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+framehop.workspace = true
+object.workspace = true
+addr2line.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

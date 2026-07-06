@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/recorder",
     "crates/replay",
+    "crates/unwind",
     "crates/decoder",
     "crates/dap",
     "crates/mirrorscope-cli",
@@ -18,12 +19,22 @@ rust-version = "1.85"
 [workspace.dependencies]
 recorder = { path = "crates/recorder" }
 replay = { path = "crates/replay" }
+unwind = { path = "crates/unwind" }
 decoder = { path = "crates/decoder" }
 dap = { path = "crates/dap" }
 crc32fast = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Unwinding + symbolization stack (issue #7).
+# Pinned for MSRV 1.85: framehop 0.16 pulls gimli 0.33 which requires rustc
+# 1.88, so we stay on the 0.15 line (gimli 0.32, MSRV 1.60) — same public API.
+# addr2line 0.24 (MSRV 1.65) drives symbolization and transitively uses
+# object 0.36, so we read ELF sections with the matching object 0.36 to keep a
+# single object/gimli version in the tree.
+framehop = "0.15"
+object = { version = "0.36", default-features = false, features = ["read", "std"] }
+addr2line = "0.24"
 
 [workspace.lints.rust]
 unsafe_code = "warn"
