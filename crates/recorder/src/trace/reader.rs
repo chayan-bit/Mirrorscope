@@ -4,13 +4,15 @@
 use std::io::Read;
 
 use super::format::{
-    Event, EventKind, Record, TraceError, BASE_HEADER_LEN, BODY_PREFIX_LEN, FORMAT_VERSION, MAGIC,
+    decode_cmdline, Cmdline, Event, EventKind, Record, TraceError, BASE_HEADER_LEN,
+    BODY_PREFIX_LEN, CMDLINE_MIN_VERSION, FORMAT_VERSION, MAGIC,
 };
 
 /// Iterates `Result<Record, TraceError>` over an append-only trace stream.
 #[derive(Debug)]
 pub struct TraceReader<R: Read> {
     inner: R,
+    cmdline: Option<Cmdline>,
     last_seq: Option<u64>,
     poisoned: bool,
 }
@@ -38,14 +40,30 @@ impl<R: Read> TraceReader<R> {
         }
 
         let header_len = u16::from_le_bytes([base[10], base[11]]) as usize;
-        let extra = header_len.saturating_sub(BASE_HEADER_LEN) as u64;
-        std::io::copy(&mut inner.by_ref().take(extra), &mut std::io::sink())?;
+        let extra = header_len.saturating_sub(BASE_HEADER_LEN);
+        let mut extra_buf = vec![0u8; extra];
+        inner
+            .read_exact(&mut extra_buf)
+            .map_err(|_| TraceError::Truncated)?;
+
+        let cmdline = if version >= CMDLINE_MIN_VERSION && !extra_buf.is_empty() {
+            Some(decode_cmdline(&extra_buf)?)
+        } else {
+            None
+        };
 
         Ok(Self {
             inner,
+            cmdline,
             last_seq: None,
             poisoned: false,
         })
+    }
+
+    /// The command line the trace was recorded from, or `None` for v1 traces
+    /// (or v2 traces written without one).
+    pub fn cmdline(&self) -> Option<&Cmdline> {
+        self.cmdline.as_ref()
     }
 
     fn read_record(&mut self) -> Result<Option<Record>, TraceError> {

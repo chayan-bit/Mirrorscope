@@ -1,5 +1,6 @@
 //! Mirrorscope CLI: `mirrorscope dap` serves DAP over stdio; `mirrorscope
-//! record` captures a target's syscalls (Linux); `replay` lands with #6.
+//! record` captures a target's syscalls (Linux); `mirrorscope replay` re-runs a
+//! trace, injecting recorded syscall results (Linux).
 
 use std::process::ExitCode;
 
@@ -14,6 +15,7 @@ fn main() -> ExitCode {
             }
         },
         Some("record") => run_record(&args[1..]),
+        Some("replay") => run_replay(&args[1..]),
         Some("--version") => {
             println!("mirrorscope {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -36,9 +38,8 @@ fn print_usage() {
     eprintln!("commands:");
     eprintln!("  dap                                  serve DAP over stdio");
     eprintln!("  record [-o <trace>] -- <cmd> [args]  record a target (Linux)");
+    eprintln!("  replay [-t <trace>] [--to <seq>]     replay a trace (Linux)");
     eprintln!("  --version                            print the version");
-    eprintln!();
-    eprintln!("`replay` lands with issue #6.");
 }
 
 #[cfg(target_os = "linux")]
@@ -87,4 +88,81 @@ fn parse_record_args(args: &[String]) -> Option<(String, String, Vec<String>)> {
         _ => return None,
     };
     Some((trace_path, program, program_args))
+}
+
+#[cfg(target_os = "linux")]
+fn run_replay(args: &[String]) -> ExitCode {
+    let (trace_path, to) = match parse_replay_args(args) {
+        Some(parts) => parts,
+        None => {
+            eprintln!("usage: mirrorscope replay [-t <trace>] [--to <seq>]");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut session = match replay::ReplaySession::launch(std::path::Path::new(&trace_path)) {
+        Ok(session) => session,
+        Err(err) => {
+            eprintln!("mirrorscope replay: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let outcome = match to {
+        Some(seq) => session.step_to(seq),
+        None => session.run_to_end(),
+    };
+    match outcome {
+        Ok(outcome) => report_replay(&mut session, outcome),
+        Err(err) => {
+            eprintln!("mirrorscope replay: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_replay(_args: &[String]) -> ExitCode {
+    eprintln!("mirrorscope replay: replay requires Linux (ptrace)");
+    ExitCode::FAILURE
+}
+
+#[cfg(target_os = "linux")]
+fn report_replay(session: &mut replay::ReplaySession, outcome: replay::ExitOutcome) -> ExitCode {
+    match outcome {
+        replay::ExitOutcome::Exited(code) => {
+            eprintln!("replay finished: target exited with code {code}");
+            ExitCode::SUCCESS
+        }
+        replay::ExitOutcome::Signaled(sig) => {
+            eprintln!("replay finished: target killed by signal {sig}");
+            ExitCode::SUCCESS
+        }
+        replay::ExitOutcome::Running => {
+            eprintln!("replay stopped at seq {:?}", session.current_seq());
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+/// Parse `[-t <trace>] [--to <seq>]`; returns (trace_path, optional target seq).
+#[cfg(target_os = "linux")]
+fn parse_replay_args(args: &[String]) -> Option<(String, Option<u64>)> {
+    let mut trace_path = "trace.mscope".to_owned();
+    let mut to = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                trace_path = args.get(i + 1)?.clone();
+                i += 2;
+            }
+            "--to" => {
+                to = Some(args.get(i + 1)?.parse().ok()?);
+                i += 2;
+            }
+            _ => return None,
+        }
+    }
+    Some((trace_path, to))
 }

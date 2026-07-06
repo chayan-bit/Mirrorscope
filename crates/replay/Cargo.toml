@@ -9,6 +9,11 @@ rust-version.workspace = true
 
 [dependencies]
 recorder.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = ["ptrace", "signal", "process", "uio"] }
+libc = "0.2"
 
 [lints]
 workspace = true

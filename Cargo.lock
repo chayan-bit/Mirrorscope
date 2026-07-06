@@ -118,7 +118,10 @@ dependencies = [
 name = "replay"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "nix",
  "recorder",
+ "thiserror",
 ]
 
 [[package]]
