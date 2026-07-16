@@ -1,9 +1,9 @@
 //! Abstract memory access for unwinding.
 //!
 //! Unwinding only ever reads 8-byte words from the target's stack, so the
-//! reader contract is intentionally tiny. Replay will provide a
-//! `process_vm_readv`-backed implementation later; the in-process
-//! [`SelfMemory`] here is what the tests unwind against.
+//! reader contract is intentionally tiny. [`SelfMemory`] is what the
+//! in-process tests unwind against; [`RemoteMemory`] reads a stopped external
+//! tracee via `process_vm_readv` (issue #8 groundwork).
 
 use thiserror::Error;
 
@@ -57,6 +57,45 @@ impl MemoryReader for SelfMemory {
         let mut buf = [0u8; 8];
         self.file
             .read_exact_at(&mut buf, addr)
+            .map_err(|_| MemoryError::Read { addr, len: 8 })?;
+        Ok(u64::from_ne_bytes(buf))
+    }
+}
+
+/// Reads another process's memory via `process_vm_readv`.
+///
+/// The target should be ptrace-stopped for the duration of a walk so that a
+/// paired register snapshot and the stack memory it points into stay
+/// consistent; attaching and stopping the tracee is the caller's
+/// responsibility (mirroring how the recorder and replay crates already
+/// manage the ptrace lifecycle) — this type only reads.
+#[cfg(target_os = "linux")]
+pub struct RemoteMemory {
+    pid: nix::unistd::Pid,
+}
+
+#[cfg(target_os = "linux")]
+impl RemoteMemory {
+    /// Wrap a target process id for remote memory reads.
+    pub fn new(pid: i32) -> Self {
+        Self {
+            pid: nix::unistd::Pid::from_raw(pid),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl MemoryReader for RemoteMemory {
+    fn read_u64(&mut self, addr: u64) -> Result<u64, MemoryError> {
+        use nix::sys::uio::{process_vm_readv, RemoteIoVec};
+        use std::io::IoSliceMut;
+
+        let mut buf = [0u8; 8];
+        let remote = RemoteIoVec {
+            base: addr as usize,
+            len: 8,
+        };
+        process_vm_readv(self.pid, &mut [IoSliceMut::new(&mut buf)], &[remote])
             .map_err(|_| MemoryError::Read { addr, len: 8 })?;
         Ok(u64::from_ne_bytes(buf))
     }

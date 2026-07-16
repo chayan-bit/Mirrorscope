@@ -8,9 +8,10 @@
 //!
 //! This crate is deliberately standalone: it depends on neither the recorder
 //! nor the replay crate. It unwinds over an abstract [`MemoryReader`], so the
-//! same code path serves the in-process case (tests, via [`SelfMemory`]) and,
-//! later, the replayed tracee (issue #8 wires a `process_vm_readv`-based reader
-//! and the DAP `stackTrace` request onto this API).
+//! same code path serves the in-process case (tests, via [`SelfMemory`]) and
+//! the external, stopped tracee case (via [`memory::RemoteMemory`] and
+//! [`remote::RemoteUnwinder`] — issue #8 groundwork; wiring the DAP
+//! `stackTrace` request onto this API is a follow-up).
 //!
 //! # Address vocabulary
 //!
@@ -45,6 +46,8 @@
 mod elf;
 pub mod maps;
 pub mod memory;
+#[cfg(target_os = "linux")]
+pub mod remote;
 pub mod symbolize;
 pub mod unwinder;
 
@@ -53,7 +56,10 @@ pub use symbolize::{SymbolizedFrame, Symbolizer};
 pub use unwinder::StackUnwinder;
 
 #[cfg(target_os = "linux")]
-pub use memory::SelfMemory;
+pub use memory::{RemoteMemory, SelfMemory};
+
+#[cfg(target_os = "linux")]
+pub use remote::{RemoteError, RemoteUnwinder};
 
 use thiserror::Error;
 
