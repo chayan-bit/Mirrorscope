@@ -15,8 +15,10 @@ use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::Pid;
 
 use recorder::capture::payload::{SyscallEnter, SyscallExit};
-use recorder::trace::{EventKind, Record, TraceError, TraceReader};
+use recorder::trace::{Cmdline, EventKind, Record, TraceError, TraceReader};
 
+use crate::checkpoint::{self, CheckpointInfo};
+use crate::checkpoint_select;
 use crate::error::ReplayError;
 use crate::inject::{self, injection_addr};
 use crate::regs::{self, Registers};
@@ -36,6 +38,7 @@ pub enum ExitOutcome {
 /// A driven replay of a recorded target.
 pub struct ReplaySession {
     pid: Pid,
+    cmdline: Cmdline,
     records: Vec<Record>,
     cursor: usize,
     current_seq: Option<u64>,
@@ -43,6 +46,8 @@ pub struct ReplaySession {
     resume_signal: Option<Signal>,
     last_regs: Option<Registers>,
     finished: Option<ExitOutcome>,
+    checkpoint_interval: u64,
+    checkpoints: Vec<CheckpointInfo>,
     stdout: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
     stderr: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
     _child: Child,
@@ -53,6 +58,13 @@ struct Pending {
     /// Destination buffer for injected results, when this syscall is one whose
     /// result must be fed from the trace; `None` for real syscalls.
     inject_addr: Option<u64>,
+}
+
+/// Where a `run_to`/`restore_to` should resume from: a checkpoint index (and
+/// its seq), or process entry (`index: None`, `seq: 0`).
+struct StartPoint {
+    index: Option<usize>,
+    seq: u64,
 }
 
 impl ReplaySession {
@@ -70,16 +82,14 @@ impl ReplaySession {
 
         // First stop: the SIGTRAP from execve under TRACEME.
         waitpid(pid, None)?;
-        ptrace::setoptions(
-            pid,
-            ptrace::Options::PTRACE_O_TRACESYSGOOD | ptrace::Options::PTRACE_O_EXITKILL,
-        )?;
+        checkpoint::setup_options(pid)?;
 
         let stdout = child.stdout.take().map(drain_thread);
         let stderr = child.stderr.take().map(drain_thread);
 
         Ok(Self {
             pid,
+            cmdline,
             records,
             cursor: 0,
             current_seq: None,
@@ -87,10 +97,66 @@ impl ReplaySession {
             resume_signal: None,
             last_regs: None,
             finished: None,
+            checkpoint_interval: 0,
+            checkpoints: Vec::new(),
             stdout,
             stderr,
             _child: child,
         })
+    }
+
+    /// Take a fork-snapshot checkpoint every `interval` trace-sequence units of
+    /// forward progress (`0` disables checkpointing, the default). Checkpoints
+    /// are only ever taken at clean syscall boundaries during forward replay.
+    pub fn checkpoint_interval(&mut self, interval: u64) {
+        self.checkpoint_interval = interval;
+    }
+
+    /// The fork-snapshot checkpoints taken so far, ascending by seq. Backs the
+    /// DAP `listCheckpoints` request.
+    pub fn checkpoints(&self) -> &[CheckpointInfo] {
+        &self.checkpoints
+    }
+
+    /// Drive replay to `seq`, but first jump to the nearest checkpoint (or, if
+    /// none precedes `seq`, respawn from entry) so replay need not always
+    /// re-execute from process start — including going *backward* to a seq
+    /// already passed. This is the checkpoint-aware sibling of [`Self::step_to`].
+    pub fn run_to(&mut self, seq: u64) -> Result<ExitOutcome, ReplayError> {
+        let start = self.plan_start(seq);
+        if checkpoint_select::should_restart(self.current_seq, start.seq, seq) {
+            match start.index {
+                Some(index) => self.restore_to_checkpoint(index)?,
+                None => self.respawn()?,
+            }
+        }
+        self.drive(Some(seq))
+    }
+
+    /// Restore the session to the nearest checkpoint at-or-before `seq` (or to a
+    /// fresh process at entry when none precedes it), without driving forward.
+    /// After this the session is re-seated at the checkpoint's boundary.
+    pub fn restore_to(&mut self, seq: u64) -> Result<(), ReplayError> {
+        match self.plan_start(seq).index {
+            Some(index) => self.restore_to_checkpoint(index),
+            None => self.respawn(),
+        }
+    }
+
+    /// Choose the restart point for a target seq: the nearest checkpoint
+    /// at-or-before it, else process entry (`index: None`, `seq: 0`).
+    fn plan_start(&self, target: u64) -> StartPoint {
+        let seqs: Vec<u64> = self.checkpoints.iter().map(|cp| cp.seq).collect();
+        match checkpoint_select::nearest_at_or_before(&seqs, target) {
+            Some(index) => StartPoint {
+                index: Some(index),
+                seq: self.checkpoints[index].seq,
+            },
+            None => StartPoint {
+                index: None,
+                seq: 0,
+            },
+        }
     }
 
     /// Drive replay until a record with sequence number `seq` has been consumed
@@ -141,7 +207,10 @@ impl ReplaySession {
             }
             ptrace::syscall(self.pid, self.resume_signal.take())?;
             match waitpid(self.pid, None)? {
-                WaitStatus::PtraceSyscall(_) => self.on_syscall_stop()?,
+                WaitStatus::PtraceSyscall(_) => {
+                    self.on_syscall_stop()?;
+                    self.maybe_checkpoint()?;
+                }
                 WaitStatus::Stopped(_, signal) => self.on_signal_stop(signal),
                 WaitStatus::Exited(_, code) => return Ok(self.finish(ExitOutcome::Exited(code))),
                 WaitStatus::Signaled(_, sig, _) => {
@@ -149,6 +218,79 @@ impl ReplaySession {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// At a clean syscall boundary (no pending exit), fork a snapshot if the
+    /// configured interval says one is due. Never checkpoints mid-syscall, and
+    /// the gap test suppresses duplicates when replay re-covers old ground.
+    fn maybe_checkpoint(&mut self) -> Result<(), ReplayError> {
+        if self.pending.is_some() {
+            return Ok(());
+        }
+        let Some(seq) = self.current_seq else {
+            return Ok(());
+        };
+        let last = self.checkpoints.last().map(|cp| cp.seq);
+        if !checkpoint_select::is_checkpoint_due(last, seq, self.checkpoint_interval) {
+            return Ok(());
+        }
+        let snapshot = checkpoint::fork_snapshot(self.pid)?;
+        self.checkpoints.push(CheckpointInfo {
+            seq,
+            cursor: self.cursor,
+            current_seq: self.current_seq,
+            last_regs: self.last_regs,
+            snapshot,
+        });
+        Ok(())
+    }
+
+    /// Fork a fresh active tracee from a checkpoint's pristine snapshot and
+    /// re-seat the replay cursor at the checkpoint boundary. The snapshot stays
+    /// untouched so it can seed further restores (reverse-execution).
+    fn restore_to_checkpoint(&mut self, index: usize) -> Result<(), ReplayError> {
+        let checkpoint = self.checkpoints[index].clone();
+        let fresh = checkpoint::fork_snapshot(checkpoint.snapshot)?;
+        self.kill_active();
+        self.pid = fresh;
+        self.cursor = checkpoint.cursor;
+        self.current_seq = checkpoint.current_seq;
+        self.last_regs = checkpoint.last_regs;
+        self.pending = None;
+        self.resume_signal = None;
+        self.finished = None;
+        Ok(())
+    }
+
+    /// Re-spawn the recorded target from scratch under ptrace and reset the
+    /// replay cursor to entry — the fallback when no checkpoint precedes a
+    /// target seq. Existing snapshots (independent COW processes) remain valid.
+    fn respawn(&mut self) -> Result<(), ReplayError> {
+        self.kill_active();
+        let mut child = spawn_traced(&self.cmdline.program, &self.cmdline.args)?;
+        let pid = Pid::from_raw(child.id() as i32);
+        waitpid(pid, None)?;
+        checkpoint::setup_options(pid)?;
+        self.stdout = child.stdout.take().map(drain_thread);
+        self.stderr = child.stderr.take().map(drain_thread);
+        self.pid = pid;
+        self._child = child;
+        self.cursor = 0;
+        self.current_seq = None;
+        self.pending = None;
+        self.resume_signal = None;
+        self.last_regs = None;
+        self.finished = None;
+        Ok(())
+    }
+
+    /// Kill and reap the current active tracee. Snapshots are never touched here
+    /// — they are cleaned up in [`Drop`].
+    fn kill_active(&mut self) {
+        if self.finished.is_none() {
+            let _ = ptrace::kill(self.pid);
+            let _ = waitpid(self.pid, None);
         }
     }
 
@@ -251,6 +393,12 @@ impl Drop for ReplaySession {
         if self.finished.is_none() {
             let _ = ptrace::kill(self.pid);
             let _ = waitpid(self.pid, None);
+        }
+        // Fork snapshots are held-stopped children; release them explicitly so
+        // none linger past the session (EXITKILL only covers tracer exit).
+        for checkpoint in &self.checkpoints {
+            let _ = ptrace::kill(checkpoint.snapshot);
+            let _ = waitpid(checkpoint.snapshot, None);
         }
     }
 }

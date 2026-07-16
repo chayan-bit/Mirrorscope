@@ -58,6 +58,16 @@ pub enum ReplayError {
     /// The tracee kept executing after the trace ran out of records.
     #[error("trace exhausted before the tracee finished replaying")]
     TraceExhausted,
+    /// Creating or restoring a fork-snapshot checkpoint failed: the injected
+    /// clone produced an unexpected ptrace stop or no fork event. Fork
+    /// snapshots are Phase-1 best-effort; a failure is surfaced, never hidden.
+    #[error("checkpoint operation failed{}: {reason}", .seq.map(|s| format!(" at seq {s}")).unwrap_or_default())]
+    Checkpoint {
+        /// Sequence number involved, when known.
+        seq: Option<u64>,
+        /// Human-readable cause.
+        reason: &'static str,
+    },
     /// Draining the replayed target's piped stdout/stderr failed.
     #[error("failed to read replay output: {0}")]
     Output(std::io::Error),
