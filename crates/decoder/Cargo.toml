@@ -10,5 +10,13 @@ rust-version.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+unwind = { workspace = true }
+nix = { version = "0.29", features = ["process", "uio"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+nix = { version = "0.29", features = ["ptrace", "signal", "process", "uio"] }
+libc = "0.2"
+
 [lints]
 workspace = true

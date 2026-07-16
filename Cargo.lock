@@ -81,7 +81,10 @@ dependencies = [
 name = "decoder"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "nix",
  "thiserror",
+ "unwind",
 ]
 
 [[package]]

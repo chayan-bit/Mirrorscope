@@ -15,11 +15,15 @@
 //! - [`native`] — the trivial reference implementation (one task per OS
 //!   thread) proving the interface end-to-end.
 //! - [`registry`] — picks a decoder for a target.
+//! - [`ptrace_view`] (Linux only) — a [`ProcessView`] backed by ptrace
+//!   against a real, already-attached-and-stopped process.
 
 pub mod error;
 pub mod model;
 pub mod native;
 pub mod process_view;
+#[cfg(target_os = "linux")]
+pub mod ptrace_view;
 pub mod registry;
 
 mod decoder_trait;
@@ -28,4 +32,6 @@ pub use decoder_trait::SemanticDecoder;
 pub use error::DecoderError;
 pub use native::NativeThreadsDecoder;
 pub use process_view::ProcessView;
+#[cfg(target_os = "linux")]
+pub use ptrace_view::{PtraceProcessView, PtraceViewError};
 pub use registry::select_decoder;

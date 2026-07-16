@@ -53,4 +53,25 @@ pub enum DecoderError {
         /// Human-readable description of what made the tree invalid.
         reason: String,
     },
+
+    /// A ptrace register read against a real, attached thread failed (e.g.
+    /// the thread exited or was never attached). Distinct from
+    /// [`Self::UnknownThread`], which means the thread id was never seen at
+    /// all.
+    #[error("failed to read registers for thread {thread:?}: {reason}")]
+    RegisterReadFailed {
+        /// The thread the register read targeted.
+        thread: ThreadId,
+        /// Underlying ptrace failure description.
+        reason: String,
+    },
+
+    /// Unwinding the physical call stack of a real, attached thread failed.
+    #[error("failed to unwind physical frames for thread {thread:?}: {reason}")]
+    PhysicalFramesFailed {
+        /// The thread the unwind targeted.
+        thread: ThreadId,
+        /// Underlying unwinder failure description.
+        reason: String,
+    },
 }
