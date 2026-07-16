@@ -4,7 +4,7 @@ A cross-platform, eBPF-assisted **time-travel debugger** for C, Rust, and Go - w
 
 Mirrorscope is a standalone tool (usable from any DAP client, including VS Code). It is also the **debug engine** of the [Life OS Workbench](https://github.com/chayan-bit/lifeos-workbench) (local `../lifeos-workbench`), which is its primary DAP client and native host UI - see [§10](#10-workbench-integration).
 
-> Status: design-complete specification, pre-implementation. This README is the canonical architecture doc; `CLAUDE.md` is the working-rules companion.
+> Status: phases 1-2 implemented (single- and multi-threaded ptrace capture, replay with syscall injection and divergence detection, retroactive hardware watchpoints, a DAP server wired to real replay), phase 4 implemented for Tokio's current-thread scheduler, phase 5 implemented for go1.24, phase 3 (eBPF capture) not started, phase 6 not started. See [§12](#12-status) for the per-phase detail. This README is the canonical architecture doc; `CLAUDE.md` is the working-rules companion.
 
 ---
 
@@ -227,4 +227,83 @@ Mirrorscope must remain fully usable **without** the Workbench (VS Code, `nvim-d
 
 ## 12. Status
 
-Design-complete specification, pre-implementation. See `CLAUDE.md` for working rules and the sibling [`lifeos-workbench`](https://github.com/chayan-bit/lifeos-workbench) for the host UI + agentic-debugging integration.
+Status against the [§8 build order](#8-build-order), as of the commits actually on `main`.
+This section describes committed code only; work in flight in other branches or working trees is not reflected here until it lands.
+
+| Phase | Scope | Status |
+|---|---|---|
+| 1 | Single-threaded C/Rust; ptrace syscall capture; fork checkpointing; basic DAP | **Done.** `crates/recorder` captures syscalls via `PTRACE_SYSCALL`; `crates/replay` restores from a fork-snapshot checkpoint and replays forward, injecting recorded syscall results. |
+| 2 | Multi-threaded; single-core serialization + divergence detection; retroactive watchpoints | **Done.** The recorder's single-core scheduler (`crates/recorder/src/capture/sched.rs`) serializes threads onto one core and records the interleaving as trace-format-v3 per-tid events (`SchedSwitch`/`ThreadSpawn`/`ThreadExit`). Replay injects syscall results and detects checksum divergence, surfacing `ReplayError::Diverged` rather than showing wrong state. Retroactive hardware watchpoints (x86-64 debug registers, aarch64 `NT_ARM_HW_WATCH`) re-run a replay pass to report every access to an address across history, exposed via `mirrorscope watch` ([§13](#13-try-it)). |
+| 3 | Move capture ptrace → eBPF (`aya`) tracepoints/uprobes | **Not started.** Capture is ptrace-only; no `aya` dependency or eBPF code is on `main` yet. |
+| 4 | Async-Rust semantic layer | **Done for Tokio's current-thread scheduler.** `crates/decoder/src/async_rust` decodes the await-point logical task tree from rustc's coroutine `DW_TAG_variant_part` state machines, verified against tokio 1.44/1.52's state-bit layout, and enumerates live tasks by walking thread-local `OwnedTasks`. Verified window: tokio 1.44.x, current-thread scheduler; outside that window the decoder declines (`DecoderError::NotApplicable`) rather than guessing, and callers fall back to the native decoder. Multi-threaded Tokio schedulers and waker-causality reconstruction are not yet implemented. |
+| 5 | Go goroutine layer | **Done for go1.24.** `crates/decoder/src/go` walks `runtime.allgs` using DWARF-derived runtime offsets (Delve-style, vendored per Go version) and unwinds from `gobuf.sp/pc`. Verified against go1.24; other Go versions are not yet in the offset table, and stack-growth relocation across a checkpoint boundary is not yet handled as a first-class event. |
+| 6 | C++20 coroutines + Swift decoders; task-timeline polish; Workbench panes | **Not started.** |
+
+Also done, ahead of the phase list above: remote-process unwinding and symbolization (`crates/unwind`, framehop + gimli/addr2line/object, x86-64 + aarch64) and a DAP server (`crates/dap`) wired to the real replay engine - `launch` with a `trace` argument selects it over the portable stub, serving `threads`/`stackTrace`/`scopes`/`variables`, `stepBack`/`reverseContinue`, and the vendor `listCheckpoints`/`taskTimeline`/`jumpToEvent` requests.
+
+Honest limitations the code documents, not glossed over:
+- Determinism is sound only under the single-core model: a program with a true data race outside recorded synchronization points can diverge on replay, and Mirrorscope surfaces that as a diverged-replay error rather than silently showing wrong state.
+- The async-Rust and Go decoders are pinned to the rustc/Go versions they were verified against; unverified versions fall back to the native (thread-only) decoder instead of risking a wrong read of compiler-internal layout.
+- Debug registers are not inherited across `fork`, so a hardware watchpoint is re-armed after every checkpoint restore or respawn.
+
+See `CLAUDE.md` for working rules and the sibling [`lifeos-workbench`](https://github.com/chayan-bit/lifeos-workbench) for the host UI + agentic-debugging integration.
+
+---
+
+## 13. Try it
+
+All commands below run on Linux (ptrace-backed); on other platforms `record`/`replay`/`watch` print a clear "requires Linux" error and exit non-zero, and `dap` still serves the portable stub backend so a client can attach to something.
+
+```
+mirrorscope <command>
+
+commands:
+  dap                                    serve DAP over stdio
+  record [-o <trace>] -- <cmd> [args]    record a target (Linux)
+  replay [-t <trace>] [--to <seq>]       replay a trace (Linux)
+  watch <trace> --addr <a> --len <n>     every write to an address (Linux)
+  --version                              print the version
+```
+
+Record a target, then replay it back:
+
+```sh
+mirrorscope record -o trace.mscope -- ./my-program --some-flag
+mirrorscope replay -t trace.mscope            # replay to the end
+mirrorscope replay -t trace.mscope --to 4200  # replay to a specific sequence number
+```
+
+Find every access to a memory address across the whole recorded history (the retroactive-watchpoint feature from [§7](#7-layer-4--dap-server--replay-engine)):
+
+```sh
+mirrorscope watch trace.mscope --addr 0x7fffdeadbeef --len 8       # writes only
+mirrorscope watch trace.mscope --addr 0x7fffdeadbeef --len 8 --rw  # reads and writes
+```
+
+`--addr` accepts hex (`0x…`) or decimal; `--len` must be 1, 2, 4, or 8 (the hardware watchpoint sizes).
+
+Serve DAP over stdio for any DAP client (VS Code, `nvim-dap`, the Workbench):
+
+```sh
+mirrorscope dap
+```
+
+Point the client's `launch` request at a recorded trace (a `trace` argument in the launch config) to get the real replay backend instead of the portable stub; the DAP server answers `threads`, `stackTrace`, `scopes`, `variables`, `stepBack`, `reverseContinue`, and the vendor `listCheckpoints`/`taskTimeline`/`jumpToEvent` requests over that trace.
+
+---
+
+## 14. Developing on macOS
+
+Mirrorscope's recording, replay, and remote-unwinding code is Linux-only (ptrace, `/proc`, hardware debug registers), but the decoder crate's portable core (the `TaskTree`/`LogicalFrame` model, DWARF layout parsing, the schedule-enforcement bookkeeping) is `cfg`-gated to build and unit-test on any host.
+
+- **Portable tests** (the majority of unit tests) run natively on macOS: `cargo test --workspace`.
+- **Linux-gated integration tests** (real ptrace capture/replay/watchpoints against a spawned child) only compile under `cfg(target_os = "linux")` and need a Linux container locally:
+
+  ```sh
+  docker run --rm --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+    -v $PWD:/w -w /w -e CARGO_TARGET_DIR=/w/target-linux \
+    rust:1.85-slim-bookworm cargo test --workspace
+  ```
+
+  `--cap-add=SYS_PTRACE` and the seccomp override are required because ptrace is blocked by Docker's default seccomp profile; a separate `CARGO_TARGET_DIR` keeps the Linux build artifacts out of the macOS host's `target/`.
+- **CI** runs the full workspace test suite on Linux for both `ubuntu-24.04` (x86-64) and `ubuntu-24.04-arm` (aarch64), plus `cargo fmt --check` and `cargo clippy --all-targets -D warnings`, on every push to `main` and every pull request (`.github/workflows/`).
