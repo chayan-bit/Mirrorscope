@@ -35,6 +35,10 @@ serde_json = "1"
 framehop = "0.15"
 object = { version = "0.36", default-features = false, features = ["read", "std"] }
 addr2line = "0.24"
+# DWARF reader for the Go decoder's runtime-offset resolution (issue #23).
+# Pinned to the 0.31 line so it shares addr2line 0.24's gimli in the tree
+# rather than adding a third gimli version.
+gimli = { version = "0.31", default-features = false, features = ["read", "std"] }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

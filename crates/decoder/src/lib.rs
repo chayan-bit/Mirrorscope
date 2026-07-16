@@ -14,11 +14,14 @@
 //! - [`SemanticDecoder`] — the trait itself.
 //! - [`native`] — the trivial reference implementation (one task per OS
 //!   thread) proving the interface end-to-end.
+//! - [`go`] — the goroutine decoder: walks `runtime.allgs` into a task tree
+//!   using DWARF-derived runtime offsets (the first language plugin).
 //! - [`registry`] — picks a decoder for a target.
 //! - [`ptrace_view`] (Linux only) — a [`ProcessView`] backed by ptrace
 //!   against a real, already-attached-and-stopped process.
 
 pub mod error;
+pub mod go;
 pub mod model;
 pub mod native;
 pub mod process_view;
@@ -30,6 +33,7 @@ mod decoder_trait;
 
 pub use decoder_trait::SemanticDecoder;
 pub use error::DecoderError;
+pub use go::{GoDecodeError, GoLayout, GoroutineDecoder};
 pub use native::NativeThreadsDecoder;
 pub use process_view::ProcessView;
 #[cfg(target_os = "linux")]

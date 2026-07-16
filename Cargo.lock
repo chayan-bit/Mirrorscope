@@ -83,8 +83,10 @@ dependencies = [
 name = "decoder"
 version = "0.1.0"
 dependencies = [
+ "gimli 0.31.1",
  "libc",
  "nix",
+ "object",
  "thiserror",
  "unwind",
 ]
