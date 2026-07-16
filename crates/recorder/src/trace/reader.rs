@@ -4,14 +4,15 @@
 use std::io::Read;
 
 use super::format::{
-    decode_cmdline, Cmdline, Event, EventKind, Record, TraceError, BASE_HEADER_LEN,
-    BODY_PREFIX_LEN, CMDLINE_MIN_VERSION, FORMAT_VERSION, MAGIC,
+    decode_body, decode_cmdline, min_body_len, Cmdline, Record, TraceError, BASE_HEADER_LEN,
+    CMDLINE_MIN_VERSION, FORMAT_VERSION, MAGIC,
 };
 
 /// Iterates `Result<Record, TraceError>` over an append-only trace stream.
 #[derive(Debug)]
 pub struct TraceReader<R: Read> {
     inner: R,
+    version: u16,
     cmdline: Option<Cmdline>,
     last_seq: Option<u64>,
     poisoned: bool,
@@ -54,10 +55,16 @@ impl<R: Read> TraceReader<R> {
 
         Ok(Self {
             inner,
+            version,
             cmdline,
             last_seq: None,
             poisoned: false,
         })
+    }
+
+    /// The format version declared in the trace header.
+    pub fn version(&self) -> u16 {
+        self.version
     }
 
     /// The command line the trace was recorded from, or `None` for v1 traces
@@ -75,7 +82,7 @@ impl<R: Read> TraceReader<R> {
         }
 
         let body_len = u32::from_le_bytes(len_buf) as usize;
-        if body_len < BODY_PREFIX_LEN {
+        if body_len < min_body_len(self.version) {
             return Err(TraceError::Truncated);
         }
 
@@ -88,7 +95,7 @@ impl<R: Read> TraceReader<R> {
             .read_exact(&mut crc_buf)
             .map_err(|_| TraceError::Truncated)?;
 
-        let record = decode_body(&body)?;
+        let record = decode_body(self.version, &body)?;
         if crc32fast::hash(&body) != u32::from_le_bytes(crc_buf) {
             return Err(TraceError::ChecksumMismatch { seq: record.seq });
         }
@@ -149,19 +156,4 @@ fn read_exact_or_eof<R: Read>(inner: &mut R, buf: &mut [u8]) -> Result<ReadOutco
         filled += n;
     }
     Ok(ReadOutcome::Full)
-}
-
-fn decode_body(body: &[u8]) -> Result<Record, TraceError> {
-    let seq = u64::from_le_bytes(body[0..8].try_into().expect("length checked"));
-    let timestamp_ns = u64::from_le_bytes(body[8..16].try_into().expect("length checked"));
-    let kind = EventKind::from_u16(u16::from_le_bytes([body[16], body[17]]));
-    let payload = body[BODY_PREFIX_LEN..].to_vec();
-    Ok(Record {
-        seq,
-        event: Event {
-            kind,
-            timestamp_ns,
-            payload,
-        },
-    })
 }

@@ -3,7 +3,9 @@
 
 use std::io::Write;
 
-use super::format::{encode_cmdline, Event, TraceError, BASE_HEADER_LEN, FORMAT_VERSION, MAGIC};
+use super::format::{
+    encode_body, encode_cmdline, Event, TraceError, BASE_HEADER_LEN, FORMAT_VERSION, MAGIC,
+};
 
 /// Writes the versioned header, then appends checksummed records.
 ///
@@ -62,13 +64,4 @@ impl<W: Write> TraceWriter<W> {
     pub fn into_inner(self) -> W {
         self.inner
     }
-}
-
-fn encode_body(seq: u64, event: &Event) -> Vec<u8> {
-    let mut body = Vec::with_capacity(18 + event.payload.len());
-    body.extend_from_slice(&seq.to_le_bytes());
-    body.extend_from_slice(&event.timestamp_ns.to_le_bytes());
-    body.extend_from_slice(&event.kind.to_u16().to_le_bytes());
-    body.extend_from_slice(&event.payload);
-    body
 }

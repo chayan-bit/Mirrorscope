@@ -5,15 +5,25 @@ pub const MAGIC: [u8; 8] = *b"MSCOPETR";
 
 /// Current format version written by [`super::TraceWriter`].
 ///
-/// v2 embeds the recorded command line in the header (see [`Cmdline`]) so the
-/// replay engine knows what to re-execute; v1 traces carry none.
-pub const FORMAT_VERSION: u16 = 2;
+/// - v1: bare header, no embedded command line, record body carries no tid.
+/// - v2: header embeds the recorded command line (see [`Cmdline`]) so the
+///   replay engine knows what to re-execute.
+/// - v3: every record body carries the originating thread id (`tid`), and the
+///   multi-threaded capture backend emits [`EventKind::SchedSwitch`],
+///   [`EventKind::ThreadSpawn`], and [`EventKind::ThreadExit`] so replay can
+///   reconstruct the recorded single-core thread interleaving.
+///
+/// The reader understands every version ≤ this; older traces stay readable.
+pub const FORMAT_VERSION: u16 = 3;
 
 /// Fixed portion of the header: magic + version + header_len.
 pub(crate) const BASE_HEADER_LEN: usize = 12;
 
 /// First format version whose header can embed a [`Cmdline`].
 pub(crate) const CMDLINE_MIN_VERSION: u16 = 2;
+
+/// First format version whose record body carries a per-event thread id.
+pub(crate) const TID_MIN_VERSION: u16 = 3;
 
 /// The command line a trace was recorded from: the program plus its arguments.
 ///
@@ -74,8 +84,22 @@ fn read_str(buf: &[u8], pos: &mut usize) -> Result<String, TraceError> {
     String::from_utf8(slice.to_vec()).map_err(|_| TraceError::MalformedHeader)
 }
 
-/// Body bytes preceding the payload: seq + timestamp_ns + kind.
+/// Body bytes preceding the payload in a pre-v3 (tid-less) trace:
+/// seq + timestamp_ns + kind.
 pub(crate) const BODY_PREFIX_LEN: usize = 18;
+
+/// Body bytes preceding the payload in a v3+ trace: seq + timestamp_ns +
+/// tid + kind.
+pub(crate) const BODY_PREFIX_LEN_V3: usize = 22;
+
+/// Smallest legal record body for a trace written at `version`.
+pub(crate) fn min_body_len(version: u16) -> usize {
+    if version >= TID_MIN_VERSION {
+        BODY_PREFIX_LEN_V3
+    } else {
+        BODY_PREFIX_LEN
+    }
+}
 
 /// A captured source of non-determinism, before a sequence number is assigned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,16 +108,34 @@ pub struct Event {
     pub kind: EventKind,
     /// Monotonic capture timestamp in nanoseconds.
     pub timestamp_ns: u64,
+    /// The thread id this event was captured from. `None` for v1/v2 traces
+    /// (which predate per-event tids) and for events not attributed to a
+    /// specific thread; `Some` for every record in a v3+ trace.
+    pub tid: Option<u32>,
     /// Kind-specific encoded data (registers, syscall results, tids, …).
     pub payload: Vec<u8>,
 }
 
 impl Event {
-    /// Convenience constructor.
+    /// Construct an event with no thread attribution (`tid == None`).
+    ///
+    /// A v3 [`super::TraceWriter`] still records a tid for it, defaulting to
+    /// `0`; use [`Event::new_with_tid`] to attribute it to a real thread.
     pub fn new(kind: EventKind, timestamp_ns: u64, payload: Vec<u8>) -> Self {
         Self {
             kind,
             timestamp_ns,
+            tid: None,
+            payload,
+        }
+    }
+
+    /// Construct an event captured from thread `tid`.
+    pub fn new_with_tid(kind: EventKind, timestamp_ns: u64, tid: u32, payload: Vec<u8>) -> Self {
+        Self {
+            kind,
+            timestamp_ns,
+            tid: Some(tid),
             payload,
         }
     }
@@ -129,6 +171,14 @@ pub enum EventKind {
     Fork,
     /// A full-process checkpoint was taken at this point.
     Checkpoint,
+    /// A new thread/process was followed under ptrace. Payload is a
+    /// [`ThreadSpawn`](crate::capture::payload::ThreadSpawn) (parent + child
+    /// tids); the record's own `tid` is the spawning thread. (v3+)
+    ThreadSpawn,
+    /// A followed thread/process exited. Payload is a
+    /// [`ThreadExit`](crate::capture::payload::ThreadExit); the record's own
+    /// `tid` is the exiting thread. (v3+)
+    ThreadExit,
     /// Kind emitted by a newer writer; preserved verbatim.
     Unknown(u16),
 }
@@ -145,6 +195,8 @@ impl EventKind {
             Self::SyncRelease => 6,
             Self::Fork => 7,
             Self::Checkpoint => 8,
+            Self::ThreadSpawn => 9,
+            Self::ThreadExit => 10,
             Self::Unknown(raw) => raw,
         }
     }
@@ -160,9 +212,50 @@ impl EventKind {
             6 => Self::SyncRelease,
             7 => Self::Fork,
             8 => Self::Checkpoint,
+            9 => Self::ThreadSpawn,
+            10 => Self::ThreadExit,
             other => Self::Unknown(other),
         }
     }
+}
+
+/// Encode a record body for the current ([`FORMAT_VERSION`]) layout:
+/// `seq | timestamp_ns | tid | kind | payload`. An event with no thread
+/// attribution records tid `0`.
+pub(crate) fn encode_body(seq: u64, event: &Event) -> Vec<u8> {
+    let mut body = Vec::with_capacity(BODY_PREFIX_LEN_V3 + event.payload.len());
+    body.extend_from_slice(&seq.to_le_bytes());
+    body.extend_from_slice(&event.timestamp_ns.to_le_bytes());
+    body.extend_from_slice(&event.tid.unwrap_or(0).to_le_bytes());
+    body.extend_from_slice(&event.kind.to_u16().to_le_bytes());
+    body.extend_from_slice(&event.payload);
+    body
+}
+
+/// Decode a record body written at `version`. Pre-v3 bodies carry no tid, so
+/// the resulting [`Event::tid`] is `None`; v3+ bodies yield `Some(tid)`.
+///
+/// The caller has already verified `body.len() >= min_body_len(version)`.
+pub(crate) fn decode_body(version: u16, body: &[u8]) -> Result<Record, TraceError> {
+    let seq = u64::from_le_bytes(body[0..8].try_into().expect("length checked"));
+    let timestamp_ns = u64::from_le_bytes(body[8..16].try_into().expect("length checked"));
+    let (tid, kind_at) = if version >= TID_MIN_VERSION {
+        let tid = u32::from_le_bytes(body[16..20].try_into().expect("length checked"));
+        (Some(tid), 20)
+    } else {
+        (None, 16)
+    };
+    let kind = EventKind::from_u16(u16::from_le_bytes([body[kind_at], body[kind_at + 1]]));
+    let payload = body[kind_at + 2..].to_vec();
+    Ok(Record {
+        seq,
+        event: Event {
+            kind,
+            timestamp_ns,
+            tid,
+            payload,
+        },
+    })
 }
 
 /// Errors surfaced by the trace reader/writer.

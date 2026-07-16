@@ -27,6 +27,94 @@ pub struct SyscallExit {
     pub data: Vec<u8>,
 }
 
+/// Payload of an [`EventKind::SchedSwitch`](crate::trace::EventKind) record:
+/// the thread now scheduled to run under the single-core serialization model.
+///
+/// Emitted whenever the recorder hands the (single) CPU to a different tracked
+/// thread. Replay uses this stream to force the exact recorded interleaving of
+/// instrumented points; see the multi-threaded capture module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedSwitch {
+    /// The thread id that begins running after this switch.
+    pub tid: u32,
+}
+
+/// Payload of an [`EventKind::ThreadSpawn`](crate::trace::EventKind) record:
+/// a newly followed thread/process and the thread that spawned it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadSpawn {
+    /// The spawning (parent) thread id.
+    pub parent_tid: u32,
+    /// The newly created (child) thread id now followed under ptrace.
+    pub child_tid: u32,
+}
+
+/// Payload of an [`EventKind::ThreadExit`](crate::trace::EventKind) record:
+/// a followed thread/process that has left the tracked set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadExit {
+    /// The thread id that exited.
+    pub tid: u32,
+}
+
+impl SchedSwitch {
+    /// Encode for a trace record payload.
+    pub fn encode(&self) -> Vec<u8> {
+        self.tid.to_le_bytes().to_vec()
+    }
+
+    /// Decode from a trace record payload.
+    pub fn decode(payload: &[u8]) -> Result<Self, PayloadError> {
+        Ok(Self {
+            tid: read_u32(payload, 0)?,
+        })
+    }
+}
+
+impl ThreadSpawn {
+    /// Encode for a trace record payload.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8);
+        out.extend_from_slice(&self.parent_tid.to_le_bytes());
+        out.extend_from_slice(&self.child_tid.to_le_bytes());
+        out
+    }
+
+    /// Decode from a trace record payload.
+    pub fn decode(payload: &[u8]) -> Result<Self, PayloadError> {
+        Ok(Self {
+            parent_tid: read_u32(payload, 0)?,
+            child_tid: read_u32(payload, 4)?,
+        })
+    }
+}
+
+impl ThreadExit {
+    /// Encode for a trace record payload.
+    pub fn encode(&self) -> Vec<u8> {
+        self.tid.to_le_bytes().to_vec()
+    }
+
+    /// Decode from a trace record payload.
+    pub fn decode(payload: &[u8]) -> Result<Self, PayloadError> {
+        Ok(Self {
+            tid: read_u32(payload, 0)?,
+        })
+    }
+}
+
+/// Read a little-endian `u32` at `offset`, erroring if the payload is short.
+fn read_u32(payload: &[u8], offset: usize) -> Result<u32, PayloadError> {
+    let end = offset + 4;
+    let slice = payload.get(offset..end).ok_or(PayloadError::TooShort {
+        found: payload.len(),
+        need: end,
+    })?;
+    Ok(u32::from_le_bytes(
+        slice.try_into().expect("length checked"),
+    ))
+}
+
 /// Errors decoding a syscall payload.
 #[derive(Debug, thiserror::Error)]
 pub enum PayloadError {
@@ -149,6 +237,39 @@ mod tests {
     fn rejects_short_enter_payload() {
         assert!(matches!(
             SyscallEnter::decode(&[0u8; 10]),
+            Err(PayloadError::TooShort { .. })
+        ));
+    }
+
+    #[test]
+    fn sched_switch_round_trips() {
+        let ev = SchedSwitch { tid: 4242 };
+        assert_eq!(SchedSwitch::decode(&ev.encode()).expect("decode"), ev);
+    }
+
+    #[test]
+    fn thread_spawn_round_trips() {
+        let ev = ThreadSpawn {
+            parent_tid: 1000,
+            child_tid: 1001,
+        };
+        assert_eq!(ThreadSpawn::decode(&ev.encode()).expect("decode"), ev);
+    }
+
+    #[test]
+    fn thread_exit_round_trips() {
+        let ev = ThreadExit { tid: 1001 };
+        assert_eq!(ThreadExit::decode(&ev.encode()).expect("decode"), ev);
+    }
+
+    #[test]
+    fn rejects_short_sched_payloads() {
+        assert!(matches!(
+            SchedSwitch::decode(&[0u8; 2]),
+            Err(PayloadError::TooShort { .. })
+        ));
+        assert!(matches!(
+            ThreadSpawn::decode(&[0u8; 5]),
             Err(PayloadError::TooShort { .. })
         ));
     }
