@@ -35,7 +35,7 @@ pub mod registry;
 
 mod decoder_trait;
 
-pub use async_rust::{AsyncDecodeError, TokioDecoder};
+pub use async_rust::{AsyncDecodeError, EnumerationPlan, TokioDecoder, TokioVersion};
 pub use decoder_trait::SemanticDecoder;
 pub use error::DecoderError;
 pub use go::{GoDecodeError, GoLayout, GoroutineDecoder};

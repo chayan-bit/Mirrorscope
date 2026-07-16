@@ -27,11 +27,13 @@ pub fn select_decoder() -> Box<dyn SemanticDecoder> {
 /// Detection order (the runtimes are mutually exclusive):
 /// 1. **Go** (via `.go.buildinfo` / `runtime.allgs`) → [`GoroutineDecoder`].
 /// 2. **Tokio** (via a `tokio::runtime` symbol) with resolvable coroutine
-///    DWARF → [`TokioDecoder`]. Note: the returned Tokio decoder resolves the
-///    binary's coroutine layouts but has no task roots yet, so its
-///    [`SemanticDecoder::decode_tasks`] declines with
-///    [`crate::DecoderError::NotApplicable`] until live enumeration is wired in
-///    (see [`crate::async_rust::roots`]); a caller may then fall back to
+///    DWARF → [`TokioDecoder`]. The returned decoder also resolves a live
+///    task-enumeration plan when the target is within the verified window
+///    (tokio 1.44.x, current-thread scheduler): its
+///    [`SemanticDecoder::decode_tasks`] then walks the live `OwnedTasks` to
+///    find tasks with no side channel (see [`crate::async_rust::enumerate`]).
+///    Outside that window it declines with
+///    [`crate::DecoderError::NotApplicable`], and a caller may fall back to
 ///    [`NativeThreadsDecoder`].
 /// 3. Otherwise, and on any resolution failure, [`NativeThreadsDecoder`] —
 ///    honoring the honesty rule by never returning a decoder that would guess.

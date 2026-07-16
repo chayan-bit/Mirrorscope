@@ -15,6 +15,7 @@ use crate::model::{
 };
 use crate::process_view::ProcessView;
 
+use super::enumerate::EnumerationPlan;
 use super::layout::AsyncLayouts;
 use super::rustc_version::RustcVersion;
 use super::roots::TaskRoot;
@@ -31,6 +32,11 @@ pub struct TokioDecoder {
     layouts: AsyncLayouts,
     version: RustcVersion,
     roots: Vec<TaskRoot>,
+    /// Live-enumeration plan resolved from the target binary, when available.
+    /// `None` for decoders built from parts, or when the target's tokio
+    /// version/shape is outside the verified enumeration window — decoding
+    /// then requires explicit [`Self::with_roots`].
+    plan: Option<EnumerationPlan>,
 }
 
 /// One fully-resolved node produced by the deterministic task walk, reused by
@@ -53,13 +59,17 @@ impl TokioDecoder {
             layouts,
             version,
             roots,
+            plan: None,
         }
     }
 
     /// Build a decoder by resolving coroutine layouts from the target's binary
-    /// image. The returned decoder has no task roots yet — attach them with
-    /// [`Self::with_roots`] (see [`super::roots`] for why enumeration is a
-    /// seam in v1).
+    /// image, plus a live-enumeration plan when the target's tokio
+    /// version/shape is within the verified window (see [`super::enumerate`]).
+    ///
+    /// The decoder starts with no explicit roots: if an enumeration plan
+    /// resolved, [`SemanticDecoder::decode_tasks`] walks the live `OwnedTasks`
+    /// to find them; otherwise attach roots with [`Self::with_roots`].
     ///
     /// # Errors
     /// Propagates [`AsyncDecodeError`] if the image is not a Tokio binary, has
@@ -70,7 +80,18 @@ impl TokioDecoder {
             layouts,
             version,
             roots: Vec::new(),
+            // Enumeration is best-effort: a binary we cannot enumerate (unknown
+            // tokio version, stripped CONTEXT, …) still decodes from explicit
+            // roots, so a failed plan is simply absent, not an error.
+            plan: EnumerationPlan::resolve(image).ok(),
         })
+    }
+
+    /// Whether this decoder resolved a live task-enumeration plan for its
+    /// target (i.e. `decode_tasks` can find tasks without explicit roots).
+    #[must_use]
+    pub fn can_enumerate(&self) -> bool {
+        self.plan.is_some()
     }
 
     /// Attach the task roots to decode (replaces any existing roots).
@@ -98,16 +119,10 @@ impl TokioDecoder {
     /// are numbered from one past the max root id, in depth-first order, so
     /// the numbering is reproducible across calls on identical memory.
     fn enumerate(&self, view: &dyn ProcessView) -> Result<Vec<DecodedNode>, DecoderError> {
-        if self.roots.is_empty() {
-            return Err(DecoderError::NotApplicable {
-                reason: "no task roots supplied; live task enumeration is a future phase \
-                         (see async_rust::roots)"
-                    .to_string(),
-            });
-        }
-        let mut next_id = self.roots.iter().map(|r| r.id).max().unwrap_or(0) + 1;
+        let roots = self.effective_roots(view)?;
+        let mut next_id = roots.iter().map(|r| r.id).max().unwrap_or(0) + 1;
         let mut out = Vec::new();
-        for root in &self.roots {
+        for root in &roots {
             self.expand(
                 view,
                 root.base,
@@ -120,6 +135,32 @@ impl TokioDecoder {
             )?;
         }
         Ok(out)
+    }
+
+    /// The roots to decode: explicit roots when attached, else live-enumerated
+    /// from the target via the [`EnumerationPlan`]. Declines honestly when
+    /// neither is available.
+    fn effective_roots(&self, view: &dyn ProcessView) -> Result<Vec<TaskRoot>, DecoderError> {
+        if !self.roots.is_empty() {
+            return Ok(self.roots.clone());
+        }
+        let plan = self.plan.as_ref().ok_or_else(|| DecoderError::NotApplicable {
+            reason: "no task roots and no enumeration plan (target outside the verified \
+                     tokio-enumeration window; see async_rust::enumerate)"
+                .to_string(),
+        })?;
+        let roots = plan
+            .enumerate_roots(view, &self.layouts)
+            .map_err(|e| DecoderError::NotApplicable {
+                reason: format!("live tokio task enumeration declined: {e}"),
+            })?;
+        if roots.is_empty() {
+            return Err(DecoderError::NotApplicable {
+                reason: "tokio runtime present but no decodable spawned tasks were found"
+                    .to_string(),
+            });
+        }
+        Ok(roots)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -21,10 +21,11 @@
 //! `Box<dyn SemanticDecoder>`.
 //!
 //! ## Scope & honesty (v1)
-//! - **Enumeration is a seam, not a walk** (see [`roots`]): the robust
-//!   production anchor (TLS `CONTEXT` → sharded `OwnedTasks` → vtable→type) is
-//!   a large, fragile tokio-internal subsystem deliberately deferred; the
-//!   decoding those roots feed is fully real.
+//! - **Enumeration is a real walk** ([`enumerate`]): the TLS `CONTEXT` →
+//!   sharded `OwnedTasks` → vtable→type anchor is implemented for the verified
+//!   window (tokio 1.44.x, current-thread scheduler) and declines honestly
+//!   otherwise. The [`roots`] seam is retained so explicit roots (e.g. the
+//!   layout-regression test) still drive the same decode.
 //! - **`select!`** shares the `join!` fan-out mechanism (multiple pending child
 //!   futures in the active variant become tree children); which branch will
 //!   win is not predicted — all pending branches are shown, honestly.
@@ -37,6 +38,7 @@
 
 pub mod decode;
 pub mod dwarf;
+pub mod enumerate;
 pub mod error;
 pub mod layout;
 pub mod roots;
@@ -46,6 +48,7 @@ pub mod state;
 mod decoder;
 
 pub use decoder::TokioDecoder;
+pub use enumerate::{EnumerateError, EnumerationPlan, TokioVersion};
 pub use error::AsyncDecodeError;
 pub use layout::{AsyncFnLayout, AsyncLayouts};
 pub use roots::TaskRoot;

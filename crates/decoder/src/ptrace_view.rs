@@ -190,6 +190,20 @@ impl ProcessView for PtraceProcessView {
         Ok(buf)
     }
 
+    fn thread_pointer(&self, thread: ThreadId) -> Result<Option<u64>, DecoderError> {
+        // Validate the thread belongs to this view before touching ptrace.
+        self.thread_view(thread)?;
+        let tid = thread.0 as i32;
+        read_thread_pointer(tid).map_err(|reason| DecoderError::RegisterReadFailed {
+            thread,
+            reason,
+        })
+    }
+
+    fn executable_base(&self) -> Option<u64> {
+        executable_base(self.pid)
+    }
+
     fn physical_frames(&self, thread: ThreadId) -> Result<Vec<PhysicalFrame>, DecoderError> {
         let view = self.thread_view(thread)?;
         let leaf_sp = self.registers(thread)?.sp;
@@ -245,6 +259,80 @@ fn task_ids(pid: i32) -> std::io::Result<Vec<i32>> {
 fn read_comm(pid: i32, tid: i32) -> std::io::Result<String> {
     let raw = fs::read_to_string(format!("/proc/{pid}/task/{tid}/comm"))?;
     Ok(raw.trim_end().to_string())
+}
+
+/// The runtime load base of the main executable: the lowest mapped address in
+/// `/proc/<pid>/maps` backed by the file `/proc/<pid>/exe` points to.
+fn executable_base(pid: i32) -> Option<u64> {
+    let exe = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    let exe = exe.to_str()?;
+    let maps = fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
+    maps.lines()
+        .filter(|line| line.ends_with(exe))
+        .filter_map(|line| line.split('-').next())
+        .filter_map(|hex| u64::from_str_radix(hex, 16).ok())
+        .min()
+}
+
+/// The ptrace note type for the aarch64 TLS register set (`NT_ARM_TLS`), not
+/// exported by `libc`.
+#[cfg(target_arch = "aarch64")]
+const NT_ARM_TLS: libc::c_int = 0x401;
+
+/// Read a ptrace-stopped thread's thread-pointer register.
+///
+/// `Ok(Some(tp))` on success, `Ok(None)` on an architecture with no supported
+/// reader, `Err(reason)` if the ptrace read failed. The caller must already be
+/// this thread's tracer with the thread stopped.
+#[allow(unsafe_code)]
+#[cfg(target_arch = "aarch64")]
+fn read_thread_pointer(tid: i32) -> Result<Option<u64>, String> {
+    let mut tp: u64 = 0;
+    let mut iov = libc::iovec {
+        iov_base: std::ptr::addr_of_mut!(tp).cast(),
+        iov_len: std::mem::size_of::<u64>(),
+    };
+    // SAFETY: `iov` points at a live `u64` of matching length; ptrace only
+    // writes the TLS register into it. `tid` is a thread this process traces.
+    let rc = unsafe {
+        libc::ptrace(
+            libc::PTRACE_GETREGSET,
+            tid,
+            NT_ARM_TLS as *mut libc::c_void,
+            std::ptr::addr_of_mut!(iov).cast::<libc::c_void>(),
+        )
+    };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(Some(tp))
+}
+
+/// x86-64 thread pointer: `fs_base` from the general register set.
+#[allow(unsafe_code)]
+#[cfg(target_arch = "x86_64")]
+fn read_thread_pointer(tid: i32) -> Result<Option<u64>, String> {
+    // SAFETY: `regs` is a correctly-sized, owned `user_regs_struct`; ptrace
+    // fills it for the stopped, traced thread `tid`.
+    let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::ptrace(
+            libc::PTRACE_GETREGS,
+            tid,
+            std::ptr::null_mut::<libc::c_void>(),
+            std::ptr::addr_of_mut!(regs).cast::<libc::c_void>(),
+        )
+    };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(Some(regs.fs_base))
+}
+
+/// Fallback for architectures without a thread-pointer reader.
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn read_thread_pointer(_tid: i32) -> Result<Option<u64>, String> {
+    Ok(None)
 }
 
 #[cfg(test)]

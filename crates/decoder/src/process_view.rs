@@ -99,6 +99,31 @@ pub trait ProcessView {
     /// Returns [`DecoderError::UnknownThread`] if `thread` is not among
     /// [`Self::thread_ids`].
     fn physical_frames(&self, thread: ThreadId) -> Result<Vec<PhysicalFrame>, DecoderError>;
+
+    /// The thread pointer register of `thread` (`TPIDR_EL0` on aarch64,
+    /// `fs_base` on x86-64), used to resolve thread-local storage.
+    ///
+    /// Returns `Ok(None)` when the backing view cannot supply it (the default
+    /// — e.g. a synthetic test view). A real backend that can read the
+    /// register overrides this. Decoders needing TLS (the Tokio task
+    /// enumerator) decline gracefully when it is `None`.
+    ///
+    /// # Errors
+    /// Returns a [`DecoderError`] only when the read is attempted and fails
+    /// (e.g. the thread exited); an unsupported backend returns `Ok(None)`.
+    fn thread_pointer(&self, thread: ThreadId) -> Result<Option<u64>, DecoderError> {
+        let _ = thread;
+        Ok(None)
+    }
+
+    /// The runtime load address of the target's main executable — the base of
+    /// its first mapped segment — used to recover the load bias for
+    /// symbol/address de-biasing.
+    ///
+    /// Returns `None` when the backing view cannot supply it (the default).
+    fn executable_base(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[cfg(test)]

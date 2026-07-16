@@ -18,6 +18,9 @@ gimli = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 unwind = { workspace = true }
 nix = { version = "0.29", features = ["process", "uio"] }
+# Direct ptrace regset reads for the thread pointer (TPIDR_EL0 / fs_base) that
+# Tokio TLS-based task enumeration needs; nix does not expose NT_ARM_TLS.
+libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 nix = { version = "0.29", features = ["ptrace", "signal", "process", "uio"] }

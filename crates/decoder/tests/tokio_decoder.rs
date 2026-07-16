@@ -8,15 +8,18 @@
 //! and `join!` fan-out by reading the rustc coroutine state machines out of
 //! process memory with layouts resolved from the binary's own DWARF.
 //!
-//! ## How the tasks are located (honest test-harness shortcut)
-//! Robust live enumeration (TLS `CONTEXT` → sharded `OwnedTasks` → vtable→type)
-//! is a deferred production subsystem (see `decoder::async_rust::roots`). So,
-//! exactly as the Go test accepts a prebuilt fixture via an env var, this
-//! fixture *publishes the heap addresses* of its parked task coroutines on
-//! stdout, and the test feeds them as [`TaskRoot`]s. The decoding those roots
-//! drive — discriminant read, `__awaitee` recursion, leaf classification,
-//! `join!` child discovery — is fully real, over real process memory and real
-//! DWARF.
+//! ## Two paths, one decoder
+//! 1. **Side-channel (layout regression).** The fixture *publishes the heap
+//!    addresses* of three manually-polled task coroutines on stdout; the test
+//!    feeds them as explicit [`TaskRoot`]s. This pins the coroutine decode
+//!    (discriminant read, `__awaitee` recursion, `join!` fan-out) against a
+//!    known layout without depending on enumeration.
+//! 2. **Live enumeration (no side channel).** The fixture also `tokio::spawn`s
+//!    real tasks onto its current-thread runtime; the test decodes them with
+//!    *no* published addresses, exercising the TLS `CONTEXT` → sharded
+//!    `OwnedTasks` → `poll<T, S>`→type walk (see
+//!    `decoder::async_rust::enumerate`). Both paths decode over real process
+//!    memory and real DWARF.
 //!
 //! Skips gracefully (like the Go/gcc tests) when no `cargo` toolchain is
 //! available, so `cargo test` stays green on a machine without one; the real
@@ -97,13 +100,20 @@ async fn main() {
     poll_once(&mut a);
     poll_once(&mut b);
     poll_once(&mut c);
+    // Spawn real tasks onto the runtime so live enumeration (no published
+    // address) can discover them; yield so the scheduler polls them to their
+    // first `.await` (a long timer sleep) before we report READY.
+    let s1 = tokio::spawn(sleeper(200000));
+    let s2 = tokio::spawn(sleeper(200001));
+    tokio::task::yield_now().await;
     println!("ROOT nested_parent {:p}", &*a);
     println!("ROOT sleeper {:p}", &*b);
     println!("ROOT joiner {:p}", &*c);
     println!("READY");
-    // Keep the coroutines alive across the park (their heap addresses stay
-    // fixed) and hold the channel sender so the receive never completes.
-    let _keep = (a, b, c, tx);
+    // Keep the coroutines and spawned tasks alive across the park (their heap
+    // addresses stay fixed) and hold the channel sender so the receive never
+    // completes.
+    let _keep = (a, b, c, tx, s1, s2);
     sleep(Duration::from_secs(100000)).await;
 }
 "#;
@@ -322,4 +332,69 @@ fn assert_decoded(decoder: &TokioDecoder, tree: &decoder::model::TaskTree, pid: 
 
 fn published_names(published: &[Published]) -> Vec<&str> {
     published.iter().map(|p| p.name.as_str()).collect()
+}
+
+/// The flagship path: decode a real Tokio process's spawned tasks with **no**
+/// published addresses — the decoder must walk the live `OwnedTasks` itself.
+#[test]
+fn enumerates_spawned_tasks_without_a_side_channel() {
+    let Some(bin) = fixture_binary() else {
+        return; // skipped: see stderr
+    };
+    let image = std::fs::read(&bin).expect("read fixture bytes");
+    let decoder = TokioDecoder::from_binary(&image).expect("resolve tokio layouts");
+    assert!(
+        decoder.can_enumerate(),
+        "from_binary must resolve a live-enumeration plan for the tokio 1.44 fixture"
+    );
+
+    let (mut child, _published) = spawn_ready(&bin);
+    let pid = child.id() as i32;
+    let attached = attach_all(pid);
+    assert!(!attached.is_empty(), "attached no threads of pid {pid}");
+
+    // Decode with NO roots attached: this exercises TLS CONTEXT -> OwnedTasks.
+    let tree = match PtraceProcessView::for_pid(pid).map(|v| decoder.decode_tasks(&v)) {
+        Ok(Ok(tree)) => tree,
+        other => {
+            cleanup(&mut child, &attached);
+            panic!("live enumeration decode failed: {other:?}");
+        }
+    };
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_enumerated(&tree);
+    }));
+    cleanup(&mut child, &attached);
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}
+
+/// The fixture spawns two `sleeper` tasks; enumeration must find exactly those
+/// (the manually-polled coroutines are not on the runtime, so are absent), each
+/// an async task parked on a timer.
+fn assert_enumerated(tree: &decoder::model::TaskTree) {
+    let ids = tree.flatten_preorder();
+    let sleepers: Vec<_> = ids
+        .iter()
+        .filter_map(|id| tree.node(*id))
+        .filter(|n| n.name == "sleeper")
+        .collect();
+    assert!(
+        sleepers.len() >= 2,
+        "expected >= 2 enumerated spawned sleepers, got {} (tree len {})",
+        sleepers.len(),
+        tree.len()
+    );
+    for node in &sleepers {
+        assert_eq!(node.kind, TaskKind::AsyncTask, "enumerated task not async");
+        assert_eq!(
+            node.state,
+            TaskState::Blocked {
+                on: BlockReason::Timer
+            },
+            "spawned sleeper must be timer-parked"
+        );
+    }
 }
