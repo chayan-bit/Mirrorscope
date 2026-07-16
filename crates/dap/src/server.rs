@@ -18,6 +18,15 @@ use crate::backend::{BackendError, DebugBackend, ResumeKind, StopInfo, StubBacke
 use crate::protocol::{self, Request};
 use crate::transport::{read_frame, write_frame, TransportError};
 
+/// Fallback fork-snapshot checkpoint interval (trace-sequence units of
+/// forward progress) when a `launch` request carries no `checkpointInterval`
+/// argument. Defined here — rather than in the Linux-only `replay_backend`
+/// module that consumes it — so `on_launch`'s argument parsing stays portable
+/// and buildable on every host; see
+/// [`ReplayBackend::open`](crate::replay_backend::ReplayBackend::open) for how
+/// it is applied.
+pub const DEFAULT_CHECKPOINT_INTERVAL: u64 = 200;
+
 /// A single-session DAP server.
 pub struct Server {
     next_seq: u64,
@@ -135,15 +144,25 @@ impl Server {
     }
 
     /// Launch/attach. A `trace` argument selects the replay backend (Linux);
-    /// otherwise the stub target is served. The backend's first stop is then
-    /// reported as a `stopped`/`exited` event.
+    /// otherwise the stub target is served. `checkpointInterval` (trace-seq
+    /// units, defaulting to [`DEFAULT_CHECKPOINT_INTERVAL`]) tunes how often
+    /// the replay backend takes fork-snapshot checkpoints — larger values use
+    /// less memory/fd overhead per session, smaller values bound reverse
+    /// re-execution more tightly. The backend's first stop is then reported as
+    /// a `stopped`/`exited` event, preceded by a
+    /// [`DebugBackend::checkpoint_note`] output event when the backend has one.
     fn on_launch<W: Write>(
         &mut self,
         request: &Request,
         writer: &mut W,
     ) -> Result<(), TransportError> {
         if let Some(trace) = request.arguments.get("trace").and_then(Value::as_str) {
-            match select_replay_backend(trace) {
+            let checkpoint_interval = request
+                .arguments
+                .get("checkpointInterval")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL);
+            match select_replay_backend(trace, checkpoint_interval) {
                 Ok(Some(backend)) => self.backend = backend,
                 Ok(None) => self.emit_output(
                     "replay backend unavailable on this platform; serving the stub target",
@@ -158,6 +177,9 @@ impl Server {
         match self.backend.launch(&request.arguments) {
             Ok(stop) => {
                 self.respond_success(request, json!({}), writer)?;
+                if let Some(note) = self.backend.checkpoint_note() {
+                    self.emit_output(&note, writer)?;
+                }
                 self.emit_stop(stop, writer)
             }
             Err(error) => self.fail(request, error, writer),
@@ -295,21 +317,28 @@ impl Server {
     }
 }
 
-/// Build the replay backend for `trace`, or report why it cannot be.
+/// Build the replay backend for `trace` with the given fork-snapshot
+/// `checkpoint_interval`, or report why it cannot be.
 ///
 /// On Linux: `Ok(Some(backend))` on success, `Err(message)` if the trace
 /// cannot be opened. On other platforms: `Ok(None)` — the caller keeps the
 /// stub so the server stays usable everywhere.
 #[cfg(target_os = "linux")]
-fn select_replay_backend(trace: &str) -> Result<Option<Box<dyn DebugBackend>>, String> {
-    crate::replay_backend::ReplayBackend::open(std::path::Path::new(trace))
+fn select_replay_backend(
+    trace: &str,
+    checkpoint_interval: u64,
+) -> Result<Option<Box<dyn DebugBackend>>, String> {
+    crate::replay_backend::ReplayBackend::open(std::path::Path::new(trace), checkpoint_interval)
         .map(|backend| Some(Box::new(backend) as Box<dyn DebugBackend>))
         .map_err(|error| error.to_string())
 }
 
 /// Non-Linux: the replay engine is Linux-only, so keep the stub target.
 #[cfg(not(target_os = "linux"))]
-fn select_replay_backend(_trace: &str) -> Result<Option<Box<dyn DebugBackend>>, String> {
+fn select_replay_backend(
+    _trace: &str,
+    _checkpoint_interval: u64,
+) -> Result<Option<Box<dyn DebugBackend>>, String> {
     Ok(None)
 }
 

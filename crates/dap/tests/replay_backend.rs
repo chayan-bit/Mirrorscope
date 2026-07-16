@@ -109,7 +109,11 @@ fn drives_the_full_replay_inspect_and_time_travel_loop() {
 
     let messages = drive(&[
         request(1, "initialize", json!({ "adapterID": "mirrorscope" })),
-        request(2, "launch", json!({ "trace": trace_arg })),
+        request(
+            2,
+            "launch",
+            json!({ "trace": trace_arg, "checkpointInterval": 1 }),
+        ),
         request(3, "threads", json!({})),
         request(4, "stackTrace", json!({ "threadId": 1 })),
         request(5, "scopes", json!({ "frameId": 1 })),
@@ -118,6 +122,11 @@ fn drives_the_full_replay_inspect_and_time_travel_loop() {
         request(8, "jumpToEvent", json!({ "seq": jump_target })),
         request(9, "stepBack", json!({ "threadId": 1 })),
         request(10, "reverseContinue", json!({ "threadId": 1 })),
+        // A checkpoint interval of 1 forces a snapshot at (almost) every
+        // syscall boundary crossed by the forward/backward traffic above, so
+        // the checkpoint list must now be non-empty for this single-threaded
+        // trace (see `listcheckpoints_reports_snapshots_taken_during_forward_replay`
+        // below for the dedicated assertion).
         request(11, "listCheckpoints", json!({})),
         request(12, "continue", json!({ "threadId": 1 })),
         request(13, "disconnect", json!({})),
@@ -166,9 +175,20 @@ fn drives_the_full_replay_inspect_and_time_travel_loop() {
         );
     }
 
-    // listCheckpoints: the real (checkpointing-disabled → empty) list.
+    // listCheckpoints: with checkpointing enabled (checkpointInterval: 1),
+    // the forward replay driven by jumpToEvent above must have taken at
+    // least one real fork-snapshot checkpoint for this single-threaded trace.
     let checkpoints = &response_for(&messages, "listCheckpoints")["body"]["checkpoints"];
-    assert!(checkpoints.is_array());
+    let checkpoints = checkpoints.as_array().expect("checkpoints array");
+    assert!(
+        !checkpoints.is_empty(),
+        "checkpointing is enabled for a single-threaded trace, so listCheckpoints must be \
+         non-empty after running forward: {messages:#?}"
+    );
+    assert!(
+        checkpoints[0]["seq"].is_u64(),
+        "each checkpoint entry must carry its trace seq"
+    );
 
     // continue runs to completion → exited + terminated.
     assert_eq!(response_for(&messages, "continue")["success"], true);
@@ -183,6 +203,75 @@ fn drives_the_full_replay_inspect_and_time_travel_loop() {
             .iter()
             .any(|m| m["type"] == "event" && m["event"] == "terminated"),
         "continue to end must emit a terminated event"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Checkpoint-accelerated `stepBack` must land the tracee at exactly the same
+/// logical state a direct `jumpToEvent` to the same seq would — that
+/// equivalence is the whole point of restoring the nearest checkpoint rather
+/// than always re-executing from process entry.
+///
+/// Drives two independent sessions against the same trace, both with
+/// `checkpointInterval: 1` (so every syscall boundary crossed is a checkpoint
+/// candidate): one reaches `seqs[mid - 1]` via `jumpToEvent(seqs[mid])` then
+/// `stepBack` (checkpoint-restore path), the other reaches it directly via a
+/// single `jumpToEvent(seqs[mid - 1])`. Their `stackTrace` bodies — real
+/// symbolized frames off the live tracee — must match exactly.
+#[test]
+fn stepback_lands_at_the_same_state_as_a_direct_jump_with_checkpoints_enabled() {
+    let dir = temp_dir("stepback");
+    let trace_path = record_read_heavy(&dir);
+    let seqs = exit_seqs(&trace_path);
+    assert!(seqs.len() >= 4, "need several events to step between");
+    let mid = seqs.len() / 2;
+    let target = seqs[mid];
+    let prev = seqs[mid - 1];
+    let trace_arg = trace_path.to_str().expect("utf-8 path").to_owned();
+
+    let via_stepback = drive(&[
+        request(
+            1,
+            "launch",
+            json!({ "trace": trace_arg.clone(), "checkpointInterval": 1 }),
+        ),
+        request(2, "jumpToEvent", json!({ "seq": target })),
+        request(3, "stepBack", json!({ "threadId": 1 })),
+        request(4, "stackTrace", json!({ "threadId": 1 })),
+        request(5, "disconnect", json!({})),
+    ]);
+    let via_direct_jump = drive(&[
+        request(
+            1,
+            "launch",
+            json!({ "trace": trace_arg, "checkpointInterval": 1 }),
+        ),
+        request(2, "jumpToEvent", json!({ "seq": prev })),
+        request(3, "stackTrace", json!({ "threadId": 1 })),
+        request(4, "disconnect", json!({})),
+    ]);
+
+    assert_eq!(
+        response_for(&via_stepback, "stepBack")["success"],
+        true,
+        "stepBack must succeed against the checkpoint-enabled engine"
+    );
+
+    let frames_via_stepback = &response_for(&via_stepback, "stackTrace")["body"]["stackFrames"];
+    let frames_via_direct_jump =
+        &response_for(&via_direct_jump, "stackTrace")["body"]["stackFrames"];
+    assert!(
+        !frames_via_stepback
+            .as_array()
+            .expect("frames array")
+            .is_empty(),
+        "a stopped tracee must unwind ≥1 frame"
+    );
+    assert_eq!(
+        frames_via_stepback, frames_via_direct_jump,
+        "checkpoint-restore-based stepBack must land at the same stack as a direct jump to the \
+         same seq"
     );
 
     fs::remove_dir_all(&dir).ok();

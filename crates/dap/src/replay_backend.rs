@@ -16,21 +16,36 @@
 //!   variable rather than invent values.
 //! - execution control — event-stepping at **syscall-exit** granularity, the
 //!   trace's natural event unit. `continue` runs to exit; `stepBack` /
-//!   `reverseContinue` re-seat via [`ReplaySession::run_to`] (which restores
-//!   the nearest checkpoint, or respawns from entry, then replays forward).
+//!   `reverseContinue` re-seat via [`ReplaySession::run_to`], which restores
+//!   the nearest checkpoint (rather than always respawning from entry) so
+//!   reverse stepping is O(distance to nearest checkpoint), not O(n).
 //!
-//! # The tracee-pid workaround (replay API gap)
+//! # Tracee pid
 //!
-//! Unwinding and decoding both need the live tracee pid, but [`ReplaySession`]
-//! exposes no `pid()` accessor at this commit, and its pid *changes* whenever a
-//! reverse operation respawns the target. We therefore read the pid from
-//! `/proc/thread-self/children` on every request. This is only unambiguous
-//! while there is exactly one traced child, so this backend deliberately
-//! leaves periodic checkpointing **disabled** (fork-snapshots would appear as
-//! extra children we cannot tell apart from the active tracee — their pids are
-//! `pub(crate)` inside `CheckpointInfo`). A one-line `ReplaySession::pid()`
-//! would remove the workaround and let us enable checkpoints for faster
-//! reverse stepping; see the crate report.
+//! Unwinding and decoding both need the live tracee pid. [`ReplaySession::pid`]
+//! provides it directly; its value changes whenever a reverse operation
+//! restores a checkpoint or respawns the target, so this backend re-reads it
+//! on every request rather than caching it (see [`Self::tracee_pid`]).
+//!
+//! # Checkpointing
+//!
+//! [`ReplayBackend::open`] enables periodic fork-snapshot checkpointing via
+//! [`ReplaySession::checkpoint_interval`], defaulting to
+//! [`crate::server::DEFAULT_CHECKPOINT_INTERVAL`] but overridable per-session
+//! via the `launch` request's `checkpointInterval` argument (see
+//! [`crate::server`]), so `listCheckpoints` reports the real snapshots taken
+//! and reverse execution restores the nearest one instead of always
+//! re-executing from process entry.
+//!
+//! Fork snapshots only capture a single live thread (see
+//! `replay::checkpoint`), so the replay engine self-disables checkpointing for
+//! the whole session when the trace records a multi-threaded schedule. This
+//! backend detects that up front from the trace (the same scan
+//! `replay::schedule::trace_is_multithreaded` performs internally, duplicated
+//! here in [`read_trace_meta`] since that helper is private to the replay
+//! crate) and reports it honestly rather than silently: `listCheckpoints`
+//! stays (truthfully) empty, and [`Self::checkpoint_note`] surfaces a one-line
+//! explanation the server emits as an `output` event right after `launch`.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -63,23 +78,34 @@ pub struct ReplayBackend {
     /// Set once the target has run to completion; cleared when a reverse
     /// operation respawns a fresh, live tracee.
     exited: Option<i32>,
+    /// Whether the trace records a multi-threaded schedule, and so is one the
+    /// replay engine self-disables checkpointing for (see the module docs).
+    /// Decided once from the trace at construction — mirrors
+    /// `replay::schedule::trace_is_multithreaded`, which is `pub(crate)` to
+    /// the replay crate.
+    multithreaded: bool,
 }
 
 impl ReplayBackend {
-    /// Open `trace_path`, spawn the target under the replay engine, and read
-    /// its event timeline. The target is not yet driven — [`DebugBackend::launch`]
+    /// Open `trace_path`, spawn the target under the replay engine, read its
+    /// event timeline, and enable fork-snapshot checkpointing every
+    /// `checkpoint_interval` trace-sequence units (`0` disables it; see
+    /// [`crate::server::DEFAULT_CHECKPOINT_INTERVAL`] for the server's
+    /// default). The target is not yet driven — [`DebugBackend::launch`]
     /// positions it at the first event.
     ///
     /// # Errors
     /// Fails if the trace cannot be opened or the target cannot be spawned.
-    pub fn open(trace_path: &Path) -> Result<Self, BackendError> {
-        let session = ReplaySession::launch(trace_path).map_err(engine)?;
-        let events = read_exit_seqs(trace_path)?;
+    pub fn open(trace_path: &Path, checkpoint_interval: u64) -> Result<Self, BackendError> {
+        let mut session = ReplaySession::launch(trace_path).map_err(engine)?;
+        session.checkpoint_interval(checkpoint_interval);
+        let (events, multithreaded) = read_trace_meta(trace_path)?;
         Ok(Self {
             session,
             events,
             cursor: 0,
             exited: None,
+            multithreaded,
         })
     }
 
@@ -121,26 +147,14 @@ impl ReplayBackend {
         Ok(self.classify(outcome, "step"))
     }
 
-    /// The live tracee pid, read from `/proc/thread-self/children`.
-    ///
-    /// Valid only while exactly one traced child exists (see the module docs
-    /// on why checkpointing is disabled). Fails after the target has exited.
+    /// The live tracee pid, re-read from the session on every call since a
+    /// reverse operation (checkpoint restore or respawn) gives the target a
+    /// fresh pid. Fails after the target has exited.
     fn tracee_pid(&self) -> Result<i32, BackendError> {
         if self.exited.is_some() {
             return Err(BackendError::NoTracee);
         }
-        let raw = std::fs::read_to_string("/proc/thread-self/children")
-            .map_err(|source| BackendError::Engine(format!("reading tracee children: {source}")))?;
-        let mut pids = raw.split_whitespace().filter_map(|s| s.parse::<i32>().ok());
-        let pid = pids.next().ok_or(BackendError::NoTracee)?;
-        if pids.next().is_some() {
-            return Err(BackendError::Engine(
-                "more than one traced child found; the DAP replay backend requires exactly one \
-                 (periodic checkpointing is disabled — see replay_backend docs)"
-                    .to_owned(),
-            ));
-        }
-        Ok(pid)
+        Ok(self.session.pid())
     }
 
     /// Build a decoder + a fresh view over the current stop.
@@ -262,8 +276,9 @@ impl DebugBackend for ReplayBackend {
     }
 
     fn list_checkpoints(&mut self) -> Result<Value, BackendError> {
-        // Periodic checkpointing is disabled in this backend (see module
-        // docs), so this is honestly the real — currently empty — list.
+        // The real snapshot list: empty for a multi-threaded trace (the
+        // engine self-disables checkpointing there — see `checkpoint_note`),
+        // otherwise every fork snapshot taken so far.
         let checkpoints: Vec<Value> = self
             .session
             .checkpoints()
@@ -302,22 +317,40 @@ impl DebugBackend for ReplayBackend {
             .map_or(0, |index| index);
         Ok(self.classify(outcome, "step"))
     }
+
+    fn checkpoint_note(&self) -> Option<String> {
+        self.multithreaded.then(|| {
+            "checkpointing disabled: this trace records a multi-threaded schedule, and fork \
+             snapshots can only capture a single live thread, so listCheckpoints will stay \
+             empty and stepBack/reverseContinue re-execute from process entry."
+                .to_owned()
+        })
+    }
 }
 
-/// Read the ascending seq of every `SyscallExit` record in a trace.
-fn read_exit_seqs(trace_path: &Path) -> Result<Vec<u64>, BackendError> {
+/// Read the ascending seq of every `SyscallExit` record in a trace, plus
+/// whether the trace records a multi-threaded schedule (any `SchedSwitch` /
+/// `ThreadSpawn` / `ThreadExit` record — the same test
+/// `replay::schedule::trace_is_multithreaded` uses internally, duplicated here
+/// since that helper is private to the replay crate).
+fn read_trace_meta(trace_path: &Path) -> Result<(Vec<u64>, bool), BackendError> {
     let file = File::open(trace_path)
         .map_err(|source| BackendError::Engine(format!("opening trace: {source}")))?;
     let reader = TraceReader::open(BufReader::new(file))
         .map_err(|source| BackendError::Engine(source.to_string()))?;
     let mut seqs = Vec::new();
+    let mut multithreaded = false;
     for record in reader {
         let record = record.map_err(|source| BackendError::Engine(source.to_string()))?;
-        if record.event.kind == EventKind::SyscallExit {
-            seqs.push(record.seq);
+        match record.event.kind {
+            EventKind::SyscallExit => seqs.push(record.seq),
+            EventKind::SchedSwitch | EventKind::ThreadSpawn | EventKind::ThreadExit => {
+                multithreaded = true;
+            }
+            _ => {}
         }
     }
-    Ok(seqs)
+    Ok((seqs, multithreaded))
 }
 
 /// Convert an engine error into a [`BackendError::Engine`], preserving its

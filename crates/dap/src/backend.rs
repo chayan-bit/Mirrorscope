@@ -158,6 +158,14 @@ pub trait DebugBackend {
     /// # Errors
     /// Fails on bad arguments or an engine failure.
     fn jump_to_event(&mut self, arguments: &Value) -> Result<StopInfo, BackendError>;
+
+    /// An informational note about this backend's checkpointing behavior,
+    /// surfaced once as an `output` event right after a successful `launch`
+    /// (e.g. "checkpointing disabled for this multi-threaded trace"). `None`
+    /// (the default) when there is nothing noteworthy to say.
+    fn checkpoint_note(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The static stub target: one thread, a canned stack, canned locals.
