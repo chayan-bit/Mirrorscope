@@ -14,5 +14,15 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+# The replay backend (Linux only) drives the real engine: it reads the trace's
+# event timeline (recorder), unwinds the stopped tracee (unwind), and decodes
+# its task tree (decoder). Gated so non-Linux builds stay stub-only.
+[target.'cfg(target_os = "linux")'.dependencies]
+recorder.workspace = true
+unwind.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+recorder.workspace = true
+
 [lints]
 workspace = true

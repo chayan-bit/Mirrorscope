@@ -71,10 +71,12 @@ name = "dap"
 version = "0.1.0"
 dependencies = [
  "decoder",
+ "recorder",
  "replay",
  "serde",
  "serde_json",
  "thiserror",
+ "unwind",
 ]
 
 [[package]]
