@@ -47,12 +47,14 @@ pub fn active_variant<'a>(
     layout: &'a AsyncFnLayout,
 ) -> Result<(u64, &'a VariantInfo), DecoderError> {
     let discr = read_discriminant(view, base, layout)?;
-    let variant = layout.variant_for(discr).ok_or_else(|| DecoderError::NotApplicable {
-        reason: format!(
-            "coroutine {} has discriminant {discr} matching no variant",
-            layout.type_name
-        ),
-    })?;
+    let variant = layout
+        .variant_for(discr)
+        .ok_or_else(|| DecoderError::NotApplicable {
+            reason: format!(
+                "coroutine {} has discriminant {discr} matching no variant",
+                layout.type_name
+            ),
+        })?;
     Ok((discr, variant))
 }
 
@@ -161,9 +163,11 @@ pub fn logical_stack(
     let mut cur_type = type_name.to_string();
 
     for _ in 0..MAX_AWAIT_DEPTH {
-        let layout = layouts.get(&cur_type).ok_or_else(|| DecoderError::NotApplicable {
-            reason: format!("no layout for coroutine type {cur_type}"),
-        })?;
+        let layout = layouts
+            .get(&cur_type)
+            .ok_or_else(|| DecoderError::NotApplicable {
+                reason: format!("no layout for coroutine type {cur_type}"),
+            })?;
         let (_, variant) = active_variant(view, cur_base, layout)?;
 
         if !variant.kind.is_suspend() {
@@ -189,7 +193,11 @@ pub fn logical_stack(
                 // Innermost coroutine frame awaiting a leaf future, plus the
                 // leaf frame itself.
                 let leaf = state::classify_leaf(&child.type_name);
-                frames.push(coroutine_frame(layout, variant, Some(leaf_suspend(&leaf, child))));
+                frames.push(coroutine_frame(
+                    layout,
+                    variant,
+                    Some(leaf_suspend(&leaf, child)),
+                ));
                 frames.push(leaf_frame(child, &leaf));
                 break;
             }
@@ -436,16 +444,32 @@ mod tests {
         let mut mem = FakeMemory::new();
         mem.put_u8(0x2000 + 56, 3); // nested_parent Suspend0
         mem.put_u8(0x2000 + 8 + 40, 3); // inner_leaf (at +8) Suspend0
-        let frames =
-            logical_stack(&mem, 0x2000, "probe::nested_parent::{async_fn_env#0}", &layouts())
-                .expect("stack");
+        let frames = logical_stack(
+            &mem,
+            0x2000,
+            "probe::nested_parent::{async_fn_env#0}",
+            &layouts(),
+        )
+        .expect("stack");
         let names: Vec<&str> = frames.iter().map(|f| f.display_name.as_str()).collect();
         assert!(names.contains(&"nested_parent"), "frames: {names:?}");
         assert!(names.contains(&"inner_leaf"), "frames: {names:?}");
         // Innermost is the channel-recv leaf.
-        assert_eq!(frames.last().expect("leaf frame").suspend.as_ref().expect("suspend").kind, SuspendKind::ChannelRecv);
+        assert_eq!(
+            frames
+                .last()
+                .expect("leaf frame")
+                .suspend
+                .as_ref()
+                .expect("suspend")
+                .kind,
+            SuspendKind::ChannelRecv
+        );
         // The nested_parent frame carries its await source line.
-        assert_eq!(frames[0].location.as_ref().expect("await location").line, 10);
+        assert_eq!(
+            frames[0].location.as_ref().expect("await location").line,
+            10
+        );
     }
 
     #[test]
@@ -453,7 +477,12 @@ mod tests {
         let mut mem = FakeMemory::new();
         mem.put_u8(0x1000 + 120, 3);
         let st = task_state(&mem, 0x1000, &sleeper_layout(), &layouts(), None).expect("state");
-        assert_eq!(st, TaskState::Blocked { on: BlockReason::Timer });
+        assert_eq!(
+            st,
+            TaskState::Blocked {
+                on: BlockReason::Timer
+            }
+        );
     }
 
     #[test]
@@ -466,7 +495,8 @@ mod tests {
         for i in 1..8 {
             mem.put_u8(0x9000 + i, 0);
         }
-        let st = task_state(&mem, 0x1000, &sleeper_layout(), &layouts(), Some(0x9000)).expect("state");
+        let st =
+            task_state(&mem, 0x1000, &sleeper_layout(), &layouts(), Some(0x9000)).expect("state");
         assert_eq!(st, TaskState::Completed);
     }
 
@@ -484,8 +514,14 @@ mod tests {
         mem.put_u8(0x3000 + 288, 3); // joiner Suspend0
         let children = fan_out_children(&mem, 0x3000, &joiner_layout()).expect("children");
         assert_eq!(children.len(), 2);
-        assert_eq!(children[0], (0x3000, "probe::sleeper::{async_fn_env#0}".to_string()));
-        assert_eq!(children[1], (0x3000 + 128, "probe::sleeper::{async_fn_env#0}".to_string()));
+        assert_eq!(
+            children[0],
+            (0x3000, "probe::sleeper::{async_fn_env#0}".to_string())
+        );
+        assert_eq!(
+            children[1],
+            (0x3000 + 128, "probe::sleeper::{async_fn_env#0}".to_string())
+        );
     }
 
     #[test]
