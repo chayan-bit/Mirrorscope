@@ -40,3 +40,38 @@ jobs:
 
       - name: test
         run: cargo test --workspace
+
+      - name: build mirrorscope-cli with the ebpf feature
+        run: cargo build -p mirrorscope-cli -p recorder-ebpf --features ebpf
+
+  # The BPF kernel-side programs (crates/recorder-ebpf-programs) are a
+  # separate, workspace-excluded project needing nightly + bpf-linker (issue
+  # #14). Best-effort only: never blocks the required `check` job above.
+  ebpf-programs:
+    name: recorder-ebpf-programs (best-effort)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: crates/recorder-ebpf-programs
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly + rust-src
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/recorder-ebpf-programs
+
+      # Default features (`rust-llvm-*` via `aya-rustc-llvm-proxy`) link
+      # against the exact LLVM the installed nightly rustc bundles, avoiding
+      # a system-LLVM/rustc-LLVM version mismatch ("ERROR llvm: Invalid
+      # record" from bpf-linker) — verified in local Docker testing that a
+      # system-LLVM build (`--no-default-features --features llvm-N`) is
+      # fragile against nightly's fast-moving internal LLVM version.
+      - name: Install bpf-linker
+        run: cargo +nightly install bpf-linker
+
+      - name: build (x86_64 pt_regs layout)
+        run: cargo +nightly build --release --features x86_64

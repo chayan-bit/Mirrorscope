@@ -11,10 +11,17 @@ rust-version.workspace = true
 name = "mirrorscope"
 path = "src/main.rs"
 
+[features]
+# Behind a feature, not the default: pulls in aya (Linux-only, needs root +
+# BTF to actually load anything at runtime). See crates/recorder-ebpf and
+# issue #14. Default `cargo build --workspace` is unaffected.
+ebpf = ["dep:recorder-ebpf"]
+
 [dependencies]
 recorder.workspace = true
 replay.workspace = true
 dap.workspace = true
+recorder-ebpf = { workspace = true, optional = true }
 
 [lints]
 workspace = true

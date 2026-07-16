@@ -1,0 +1,39 @@
+[workspace]
+
+[package]
+name = "recorder-ebpf-programs"
+description = "eBPF kernel-side syscall capture programs (issue #14) — standalone project, deliberately excluded from the main Mirrorscope workspace"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0 OR GPL-2.0"
+publish = false
+
+# One binary per host architecture: the kernel's `struct pt_regs` field layout
+# is architecture-specific and can't be read via `cfg(target_arch)` inside the
+# program (the *compile* target is always the `bpfel-unknown-none` BPF ISA,
+# regardless of which architecture's kernel will run it). Select via
+# `--features x86_64` / `--features aarch64` to match the deployment host —
+# see README.md.
+[features]
+default = []
+x86_64 = []
+aarch64 = []
+
+[dependencies]
+recorder-ebpf-common = { path = "../recorder-ebpf-common" }
+# Object-file wire compatibility with the userspace loader is what has to
+# line up here, not MSRV (this crate always needs nightly regardless): the
+# main workspace's `recorder-ebpf` pins the loader to aya 0.13.1 (see root
+# Cargo.toml), so this pins the matching 0.1.x aya-ebpf/aya-log-ebpf line.
+aya-ebpf = "=0.1.1"
+aya-log-ebpf = "=0.1.0"
+
+[[bin]]
+name = "recorder-ebpf-programs"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+panic = "abort"
+codegen-units = 1
+debug = 2

@@ -37,28 +37,54 @@ fn print_usage() {
     eprintln!("usage: mirrorscope <command>");
     eprintln!();
     eprintln!("commands:");
-    eprintln!("  dap                                  serve DAP over stdio");
-    eprintln!("  record [-o <trace>] -- <cmd> [args]  record a target (Linux)");
-    eprintln!("  replay [-t <trace>] [--to <seq>]     replay a trace (Linux)");
-    eprintln!("  watch <trace> --addr <a> --len <n>   every write to an address (Linux)");
-    eprintln!("  --version                            print the version");
+    eprintln!("  dap                                             serve DAP over stdio");
+    eprintln!("  record [-o <trace>] [--ebpf [--ebpf-object <path>]] -- <cmd> [args]");
+    eprintln!("                                                  record a target (Linux)");
+    eprintln!("  replay [-t <trace>] [--to <seq>]                replay a trace (Linux)");
+    eprintln!(
+        "  watch <trace> --addr <a> --len <n>              every write to an address (Linux)"
+    );
+    eprintln!("  --version                                       print the version");
+}
+
+/// A parsed `record` request.
+#[cfg(target_os = "linux")]
+struct RecordArgs {
+    trace_path: String,
+    /// Capture via eBPF (`--ebpf`) instead of the default ptrace backend.
+    ebpf: bool,
+    /// Path to the compiled `recorder-ebpf-programs` object; only meaningful
+    /// with `--ebpf`. Defaults to `$MIRRORSCOPE_EBPF_OBJECT`. Only read when
+    /// built with the `ebpf` feature; a build without it still parses (and
+    /// rejects at runtime, not parse time) `--ebpf-object` for a clearer
+    /// error message than "unknown flag".
+    #[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+    ebpf_object: Option<String>,
+    program: String,
+    program_args: Vec<String>,
 }
 
 #[cfg(target_os = "linux")]
 fn run_record(args: &[String]) -> ExitCode {
-    let parsed = parse_record_args(args);
-    let (trace_path, program, program_args) = match parsed {
-        Some(parts) => parts,
+    let parsed = match parse_record_args(args) {
+        Some(parsed) => parsed,
         None => {
-            eprintln!("usage: mirrorscope record [-o <trace>] -- <cmd> [args…]");
+            eprintln!("usage: mirrorscope record [-o <trace>] [--ebpf [--ebpf-object <path>]] -- <cmd> [args…]");
             return ExitCode::FAILURE;
         }
     };
-    match recorder::capture::record_command(&program, &program_args, trace_path.as_ref()) {
+    if parsed.ebpf {
+        return run_record_ebpf(&parsed);
+    }
+    match recorder::capture::record_command(
+        &parsed.program,
+        &parsed.program_args,
+        parsed.trace_path.as_ref(),
+    ) {
         Ok(outcome) => {
             eprintln!(
-                "recorded {} events to {trace_path} (target exit: {:?})",
-                outcome.events_recorded, outcome.exit_code
+                "recorded {} events to {} (target exit: {:?})",
+                outcome.events_recorded, parsed.trace_path, outcome.exit_code
             );
             ExitCode::SUCCESS
         }
@@ -69,27 +95,95 @@ fn run_record(args: &[String]) -> ExitCode {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn run_record(_args: &[String]) -> ExitCode {
-    eprintln!("mirrorscope record: recording requires Linux (ptrace; eBPF in Phase 3)");
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+fn run_record_ebpf(parsed: &RecordArgs) -> ExitCode {
+    let object_path = match parsed
+        .ebpf_object
+        .clone()
+        .or_else(|| std::env::var("MIRRORSCOPE_EBPF_OBJECT").ok())
+    {
+        Some(path) => path,
+        None => {
+            eprintln!(
+                "mirrorscope record --ebpf: no BPF object given (--ebpf-object <path> or \
+                 $MIRRORSCOPE_EBPF_OBJECT); build it first — see \
+                 crates/recorder-ebpf-programs/README.md"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    match recorder_ebpf::record_command(
+        &parsed.program,
+        &parsed.program_args,
+        parsed.trace_path.as_ref(),
+        object_path.as_ref(),
+    ) {
+        Ok(outcome) => {
+            eprintln!(
+                "recorded {} events to {} via eBPF (target exit: {:?})",
+                outcome.events_recorded, parsed.trace_path, outcome.exit_code
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("mirrorscope record --ebpf: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", not(feature = "ebpf")))]
+fn run_record_ebpf(_parsed: &RecordArgs) -> ExitCode {
+    eprintln!(
+        "mirrorscope record --ebpf: this build was compiled without the `ebpf` feature \
+         (cargo build --features ebpf -p mirrorscope-cli)"
+    );
     ExitCode::FAILURE
 }
 
-/// Parse `[-o <trace>] -- <cmd> [args…]`; returns (trace_path, cmd, args).
+#[cfg(not(target_os = "linux"))]
+fn run_record(_args: &[String]) -> ExitCode {
+    eprintln!("mirrorscope record: recording requires Linux (ptrace, or eBPF with --ebpf)");
+    ExitCode::FAILURE
+}
+
+/// Parse `[-o <trace>] [--ebpf [--ebpf-object <path>]] -- <cmd> [args…]`.
 #[cfg(target_os = "linux")]
-fn parse_record_args(args: &[String]) -> Option<(String, String, Vec<String>)> {
+fn parse_record_args(args: &[String]) -> Option<RecordArgs> {
     let separator = args.iter().position(|a| a == "--")?;
     let (options, target) = args.split_at(separator);
     let target = &target[1..];
     let program = target.first()?.clone();
     let program_args = target[1..].to_vec();
 
-    let trace_path = match options {
-        [] => "trace.mscope".to_owned(),
-        [flag, path] if flag == "-o" => path.clone(),
-        _ => return None,
-    };
-    Some((trace_path, program, program_args))
+    let mut trace_path = "trace.mscope".to_owned();
+    let mut ebpf = false;
+    let mut ebpf_object = None;
+    let mut i = 0;
+    while i < options.len() {
+        match options[i].as_str() {
+            "-o" => {
+                trace_path = options.get(i + 1)?.clone();
+                i += 2;
+            }
+            "--ebpf" => {
+                ebpf = true;
+                i += 1;
+            }
+            "--ebpf-object" => {
+                ebpf_object = Some(options.get(i + 1)?.clone());
+                i += 2;
+            }
+            _ => return None,
+        }
+    }
+    Some(RecordArgs {
+        trace_path,
+        ebpf,
+        ebpf_object,
+        program,
+        program_args,
+    })
 }
 
 #[cfg(target_os = "linux")]

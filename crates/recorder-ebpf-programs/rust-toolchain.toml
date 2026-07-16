@@ -1,0 +1,7 @@
+[toolchain]
+# The BPF target (`bpfel-unknown-none`) is Tier 3: it needs `-Z build-std`,
+# which needs nightly. This pin is local to this directory (cargo picks up
+# the nearest rust-toolchain.toml) and does not affect the main workspace,
+# which stays on the stable MSRV-1.85 toolchain declared at the repo root.
+channel = "nightly"
+components = ["rust-src"]

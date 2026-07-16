@@ -1,0 +1,25 @@
+[package]
+name = "recorder-ebpf"
+description = "Layer 1 (eBPF path): userspace aya loader that drains the in-kernel syscall ring buffer into the existing trace format (issue #14)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+recorder.workspace = true
+recorder-ebpf-common.workspace = true
+thiserror.workspace = true
+
+# aya's userspace crate is plain std Rust (no nightly, no bpf-linker) but the
+# functionality it wraps — loading/attaching BPF objects — only exists on
+# Linux, so it is gated exactly like `recorder`'s ptrace dependency on `nix`.
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { workspace = true }
+aya-log = { workspace = true }
+nix = { version = "0.29", features = ["signal", "process"] }
+libc = "0.2"
+
+[lints]
+workspace = true
