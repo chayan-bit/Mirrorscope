@@ -7,6 +7,7 @@
 //! Recording/replay/DAP never learn which one they got — they hold a
 //! `Box<dyn SemanticDecoder>`.
 
+use crate::async_rust::TokioDecoder;
 use crate::decoder_trait::SemanticDecoder;
 use crate::go::GoroutineDecoder;
 use crate::native::NativeThreadsDecoder;
@@ -23,18 +24,26 @@ pub fn select_decoder() -> Box<dyn SemanticDecoder> {
 
 /// Select the best decoder for a target given its binary image.
 ///
-/// Detects a Go binary (via `.go.buildinfo` / the `runtime.allgs` symbol) and
-/// resolves its runtime layout; on success returns a [`GoroutineDecoder`].
-/// Any failure — not a Go binary, or a Go binary whose layout cannot be
-/// resolved (fully stripped, unknown version) — falls through to
-/// [`NativeThreadsDecoder`], honoring the honesty rule by never returning a
-/// decoder that would guess.
+/// Detection order (the runtimes are mutually exclusive):
+/// 1. **Go** (via `.go.buildinfo` / `runtime.allgs`) → [`GoroutineDecoder`].
+/// 2. **Tokio** (via a `tokio::runtime` symbol) with resolvable coroutine
+///    DWARF → [`TokioDecoder`]. Note: the returned Tokio decoder resolves the
+///    binary's coroutine layouts but has no task roots yet, so its
+///    [`SemanticDecoder::decode_tasks`] declines with
+///    [`crate::DecoderError::NotApplicable`] until live enumeration is wired in
+///    (see [`crate::async_rust::roots`]); a caller may then fall back to
+///    [`NativeThreadsDecoder`].
+/// 3. Otherwise, and on any resolution failure, [`NativeThreadsDecoder`] —
+///    honoring the honesty rule by never returning a decoder that would guess.
 #[must_use]
 pub fn select_decoder_for_binary(image: &[u8]) -> Box<dyn SemanticDecoder> {
-    match GoroutineDecoder::from_binary(image) {
-        Ok(decoder) => Box::new(decoder),
-        Err(_) => Box::new(NativeThreadsDecoder::new()),
+    if let Ok(decoder) = GoroutineDecoder::from_binary(image) {
+        return Box::new(decoder);
     }
+    if let Ok(decoder) = TokioDecoder::from_binary(image) {
+        return Box::new(decoder);
+    }
+    Box::new(NativeThreadsDecoder::new())
 }
 
 #[cfg(test)]

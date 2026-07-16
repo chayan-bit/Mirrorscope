@@ -16,10 +16,14 @@
 //!   thread) proving the interface end-to-end.
 //! - [`go`] — the goroutine decoder: walks `runtime.allgs` into a task tree
 //!   using DWARF-derived runtime offsets (the first language plugin).
+//! - [`async_rust`] — the Tokio async-task decoder: reconstructs the logical
+//!   await-point task tree from rustc's coroutine `DW_TAG_variant_part`
+//!   state machines (the flagship novelty pillar).
 //! - [`registry`] — picks a decoder for a target.
 //! - [`ptrace_view`] (Linux only) — a [`ProcessView`] backed by ptrace
 //!   against a real, already-attached-and-stopped process.
 
+pub mod async_rust;
 pub mod error;
 pub mod go;
 pub mod model;
@@ -31,6 +35,7 @@ pub mod registry;
 
 mod decoder_trait;
 
+pub use async_rust::{AsyncDecodeError, TokioDecoder};
 pub use decoder_trait::SemanticDecoder;
 pub use error::DecoderError;
 pub use go::{GoDecodeError, GoLayout, GoroutineDecoder};
