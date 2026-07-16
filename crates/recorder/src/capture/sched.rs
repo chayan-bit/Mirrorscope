@@ -58,12 +58,24 @@ use crate::capture::timer::{PreemptionTimer, DEFAULT_QUANTUM};
 use crate::trace::{Event, EventKind, TraceWriter};
 
 /// ptrace options applied to the leader and every followed thread/process.
+///
+/// `PTRACE_O_TRACEEXEC` matters beyond the leader's own initial exec (which
+/// happens before this scheduler exists, under a plain `waitpid` in
+/// [`crate::capture::ptrace::record_command`]): without it, a *followed*
+/// child's own `execve` (e.g. a shell `vfork`-ing then `exec`-ing a command)
+/// reports as an ordinary `SIGTRAP` signal-delivery-stop, indistinguishable
+/// from a real signal. [`Scheduler::on_stopped`] would then requeue it with
+/// `resume_signal = Some(SIGTRAP)` and inject that `SIGTRAP` back into the
+/// tracee on its next resume — which, absent a handler, kills it. Setting
+/// this option reports the exec as a `PTRACE_EVENT_EXEC` stop instead, which
+/// [`Scheduler::handle`] simply requeues with no signal to redeliver.
 pub fn trace_options() -> ptrace::Options {
     ptrace::Options::PTRACE_O_TRACESYSGOOD
         | ptrace::Options::PTRACE_O_EXITKILL
         | ptrace::Options::PTRACE_O_TRACECLONE
         | ptrace::Options::PTRACE_O_TRACEFORK
         | ptrace::Options::PTRACE_O_TRACEVFORK
+        | ptrace::Options::PTRACE_O_TRACEEXEC
 }
 
 /// Per-thread capture state.
@@ -88,6 +100,13 @@ pub struct Scheduler<'w, W: Write> {
     leader_exit: Option<i32>,
     events_recorded: u64,
     threads_followed: u64,
+    /// `vfork`'d children awaiting release, keyed by child pid, valued by the
+    /// parent pid they unblock on exit. `vfork(2)` suspends the parent in the
+    /// kernel (uninterruptible) until this exact child execs or exits, so the
+    /// scheduler must never re-continue such a parent before its child has
+    /// run — doing so wastes the single running slot on a thread that cannot
+    /// produce another event, starving the child forever (see module docs).
+    vfork_pending: BTreeMap<Pid, Pid>,
 }
 
 impl<'w, W: Write> Scheduler<'w, W> {
@@ -113,17 +132,37 @@ impl<'w, W: Write> Scheduler<'w, W> {
             leader_exit: None,
             events_recorded: 0,
             threads_followed: 1,
+            vfork_pending: BTreeMap::new(),
         })
     }
 
     /// Run every thread to completion, recording the interleaving.
+    ///
+    /// Every wait in this scheduler passes `__WNOTHREAD`: by default Linux's
+    /// `waitpid(-1, ...)` reaps children of *any* thread in the calling
+    /// process's thread group, not just the caller's own. When multiple
+    /// `Scheduler`s run concurrently on different OS threads of one process
+    /// (e.g. parallel `cargo test` — each test spawns its own tracee on its
+    /// own worker thread), an unscoped wait can steal another thread's
+    /// tracee-stop notification. The stealing thread then tries to issue
+    /// `PTRACE_*` requests on a pid it never attached — which only the true
+    /// tracer thread may do — and fails with `ESRCH`; meanwhile the rightful
+    /// thread's own wait never sees the (already-reaped) stop and blocks
+    /// forever. `__WNOTHREAD` scopes every wait to this thread's own tracees.
     pub fn run(mut self) -> Result<RecordOutcome, CaptureError> {
         while !self.threads.is_empty() {
-            if self.running.is_none() && !self.resume_next()? {
-                break;
+            if self.running.is_none() {
+                // A momentarily-empty ready queue does not mean the recording
+                // is done: e.g. a vfork'd parent is deliberately left off the
+                // ready queue until its child releases it (`vfork_pending`),
+                // and a freshly-spawned child's first stop may not have been
+                // observed by `waitpid` yet. Real completion is `self.threads`
+                // truly emptying, which is caught by the loop condition and
+                // by the `ECHILD` arm below once no children remain at all.
+                self.resume_next()?;
             }
             self.timer.arm()?;
-            match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::__WALL)) {
+            match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::__WALL | WaitPidFlag::__WNOTHREAD)) {
                 Ok(status) => {
                     self.timer.disarm()?;
                     self.handle(status)?;
@@ -145,11 +184,12 @@ impl<'w, W: Write> Scheduler<'w, W> {
         })
     }
 
-    /// Pick the next ready thread and resume it. Returns `false` when none are
-    /// runnable (all remaining threads have already exited).
-    fn resume_next(&mut self) -> Result<bool, CaptureError> {
+    /// Pick the next ready thread and resume it, if any is ready. An empty
+    /// ready queue is not necessarily terminal — see the caller in
+    /// [`Scheduler::run`].
+    fn resume_next(&mut self) -> Result<(), CaptureError> {
         let Some(next) = self.ready.pop_front() else {
-            return Ok(false);
+            return Ok(());
         };
         self.record_sched_switch(next)?;
         let sig = self
@@ -158,14 +198,14 @@ impl<'w, W: Write> Scheduler<'w, W> {
             .and_then(|t| t.resume_signal.take());
         ptrace::syscall(next, sig)?;
         self.running = Some(next);
-        Ok(true)
+        Ok(())
     }
 
     /// A syscall-free tracee overran its quantum: stop and reap it so the
     /// scheduler can rotate to another thread.
     fn preempt(&mut self, cur: Pid) -> Result<(), CaptureError> {
         kill(cur, Signal::SIGSTOP)?;
-        let status = waitpid(cur, Some(WaitPidFlag::__WALL))?;
+        let status = waitpid(cur, Some(WaitPidFlag::__WALL | WaitPidFlag::__WNOTHREAD))?;
         self.handle(status)
     }
 
@@ -179,9 +219,17 @@ impl<'w, W: Write> Scheduler<'w, W> {
             WaitStatus::PtraceEvent(pid, _, event) => {
                 self.clear_running(pid);
                 if is_spawn_event(event) {
-                    self.on_spawn(pid)?;
+                    let child = self.on_spawn(pid)?;
+                    if event == libc::PTRACE_EVENT_VFORK {
+                        // Do not requeue: `pid` is suspended in-kernel until
+                        // `child` execs or exits. It's released in `on_exit`.
+                        self.vfork_pending.insert(child, pid);
+                    } else {
+                        self.requeue(pid);
+                    }
+                } else {
+                    self.requeue(pid);
                 }
-                self.requeue(pid);
             }
             WaitStatus::Stopped(pid, sig) => self.on_stopped(pid, sig)?,
             WaitStatus::Exited(pid, code) => self.on_exit(pid, Some(code))?,
@@ -214,7 +262,7 @@ impl<'w, W: Write> Scheduler<'w, W> {
         Ok(())
     }
 
-    fn on_spawn(&mut self, parent: Pid) -> Result<(), CaptureError> {
+    fn on_spawn(&mut self, parent: Pid) -> Result<Pid, CaptureError> {
         let child = Pid::from_raw(ptrace::getevent(parent)? as i32);
         let ts = self.now();
         let payload = ThreadSpawn {
@@ -230,7 +278,7 @@ impl<'w, W: Write> Scheduler<'w, W> {
         ))?;
         // The child registers itself on its own initial stop (either order is
         // handled), so we don't touch it here — it may not be waited yet.
-        Ok(())
+        Ok(child)
     }
 
     fn on_stopped(&mut self, pid: Pid, sig: Signal) -> Result<(), CaptureError> {
@@ -280,6 +328,12 @@ impl<'w, W: Write> Scheduler<'w, W> {
         self.ready.retain(|&p| p != pid);
         if pid == self.leader {
             self.leader_exit = code;
+        }
+        // If `pid` was a vfork child, its parent has been sitting suspended
+        // in-kernel since the vfork event stop; it's safe (and now necessary)
+        // to give it another turn.
+        if let Some(parent) = self.vfork_pending.remove(&pid) {
+            self.requeue(parent);
         }
         Ok(())
     }
