@@ -19,5 +19,15 @@ nix = { version = "0.29", features = ["ptrace", "signal", "process", "uio"] }
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "0.2"
 
+# libtest always runs each `#[test]` fn on a spawned worker thread, which
+# breaks this test's `PTRACE_TRACEME` handshake (see the module docs in
+# tests/remote_unwind.rs): the traced thread and the thread that raises
+# SIGSTOP must be the same one. Disabling the harness gives the file a plain
+# `fn main()` that runs on the process's actual main thread instead.
+[[test]]
+name = "remote_unwind"
+path = "tests/remote_unwind.rs"
+harness = false
+
 [lints]
 workspace = true
