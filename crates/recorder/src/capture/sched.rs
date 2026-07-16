@@ -162,7 +162,10 @@ impl<'w, W: Write> Scheduler<'w, W> {
                 self.resume_next()?;
             }
             self.timer.arm()?;
-            match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::__WALL | WaitPidFlag::__WNOTHREAD)) {
+            match waitpid(
+                Pid::from_raw(-1),
+                Some(WaitPidFlag::__WALL | WaitPidFlag::__WNOTHREAD),
+            ) {
                 Ok(status) => {
                     self.timer.disarm()?;
                     self.handle(status)?;
