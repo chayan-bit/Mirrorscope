@@ -122,7 +122,11 @@ fn elf_geometry(image: &[u8]) -> Result<(u64, u64, u64), EnumerateError> {
             _ => {}
         }
     }
-    Ok((tls_align, tls_memsz, if min_load == u64::MAX { 0 } else { min_load }))
+    Ok((
+        tls_align,
+        tls_memsz,
+        if min_load == u64::MAX { 0 } else { min_load },
+    ))
 }
 
 fn word(b: &[u8], at: usize) -> Result<[u8; 8], EnumerateError> {
@@ -153,7 +157,9 @@ fn poll_type_map(file: &object::File) -> Result<Vec<(u64, String)>, EnumerateErr
     };
     let load = |id: gimli::SectionId| -> Result<Cow<[u8]>, gimli::Error> {
         Ok(match object::Object::section_by_name(file, id.name()) {
-            Some(s) => object::ObjectSection::uncompressed_data(&s).unwrap_or(Cow::Borrowed(&[][..])),
+            Some(s) => {
+                object::ObjectSection::uncompressed_data(&s).unwrap_or(Cow::Borrowed(&[][..]))
+            }
             None => Cow::Borrowed(&[][..]),
         })
     };

@@ -43,8 +43,7 @@ pub fn is_go_object(file: &object::File) -> bool {
     if file.section_by_name(".go.buildinfo").is_some() {
         return true;
     }
-    file.symbols()
-        .any(|sym| sym.name() == Ok("runtime.allgs"))
+    file.symbols().any(|sym| sym.name() == Ok("runtime.allgs"))
 }
 
 /// Parse `bytes` as an object file and extract the Go runtime layout.
@@ -147,8 +146,16 @@ fn read_dwarf(file: &object::File) -> Result<(StructMap, VarMap), GoDecodeError>
         let unit = dwarf.unit(header).map_err(dwarf_err)?;
         let mut tree = unit.entries_tree(None).map_err(dwarf_err)?;
         let root = tree.root().map_err(dwarf_err)?;
-        walk(&dwarf, &unit, root, &targets, &vars_wanted, &mut structs, &mut vars)
-            .map_err(dwarf_err)?;
+        walk(
+            &dwarf,
+            &unit,
+            root,
+            &targets,
+            &vars_wanted,
+            &mut structs,
+            &mut vars,
+        )
+        .map_err(dwarf_err)?;
     }
     Ok((structs, vars))
 }
@@ -257,7 +264,8 @@ fn variable_addr(
     entry: &gimli::DebuggingInformationEntry<Reader>,
     address_size: u8,
 ) -> Result<Option<u64>, gimli::Error> {
-    let Some(gimli::AttributeValue::Exprloc(expr)) = entry.attr_value(gimli::DW_AT_location)? else {
+    let Some(gimli::AttributeValue::Exprloc(expr)) = entry.attr_value(gimli::DW_AT_location)?
+    else {
         return Ok(None);
     };
     let mut reader = expr.0;

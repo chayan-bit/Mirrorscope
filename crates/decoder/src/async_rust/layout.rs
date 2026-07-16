@@ -202,11 +202,26 @@ mod tests {
 
     #[test]
     fn parses_variant_kinds() {
-        assert_eq!(VariantKind::from_struct_name("Unresumed"), Some(VariantKind::Unresumed));
-        assert_eq!(VariantKind::from_struct_name("Returned"), Some(VariantKind::Returned));
-        assert_eq!(VariantKind::from_struct_name("Panicked"), Some(VariantKind::Panicked));
-        assert_eq!(VariantKind::from_struct_name("Suspend0"), Some(VariantKind::Suspend(0)));
-        assert_eq!(VariantKind::from_struct_name("Suspend7"), Some(VariantKind::Suspend(7)));
+        assert_eq!(
+            VariantKind::from_struct_name("Unresumed"),
+            Some(VariantKind::Unresumed)
+        );
+        assert_eq!(
+            VariantKind::from_struct_name("Returned"),
+            Some(VariantKind::Returned)
+        );
+        assert_eq!(
+            VariantKind::from_struct_name("Panicked"),
+            Some(VariantKind::Panicked)
+        );
+        assert_eq!(
+            VariantKind::from_struct_name("Suspend0"),
+            Some(VariantKind::Suspend(0))
+        );
+        assert_eq!(
+            VariantKind::from_struct_name("Suspend7"),
+            Some(VariantKind::Suspend(7))
+        );
         assert_eq!(VariantKind::from_struct_name("Nonsense"), None);
     }
 
@@ -228,7 +243,10 @@ mod tests {
             discr_size: 1,
             variants,
         };
-        assert_eq!(layout.variant_for(3).expect("suspend variant").kind, VariantKind::Suspend(0));
+        assert_eq!(
+            layout.variant_for(3).expect("suspend variant").kind,
+            VariantKind::Suspend(0)
+        );
         assert!(layout.variant_for(9).is_none());
         assert_eq!(layout.short_name(), "sleeper");
     }

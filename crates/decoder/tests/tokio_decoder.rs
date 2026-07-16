@@ -148,7 +148,9 @@ fn compile_fixture() -> Option<PathBuf> {
     // putting the binary somewhere unexpected.
     let build = |offline: bool| {
         let mut cmd = Command::new("cargo");
-        cmd.current_dir(&dir).env("CARGO_TARGET_DIR", &target).arg("build");
+        cmd.current_dir(&dir)
+            .env("CARGO_TARGET_DIR", &target)
+            .arg("build");
         if offline {
             cmd.arg("--offline");
         }
@@ -252,7 +254,12 @@ fn decodes_async_tasks_of_a_real_tokio_process() {
     }
 
     let (mut child, published) = spawn_ready(&bin);
-    assert_eq!(published.len(), 3, "expected 3 published roots: {:?}", published_names(&published));
+    assert_eq!(
+        published.len(),
+        3,
+        "expected 3 published roots: {:?}",
+        published_names(&published)
+    );
     let decoder = decoder.with_roots(roots_from(&published));
 
     let pid = child.id() as i32;
@@ -291,12 +298,18 @@ fn assert_decoded(decoder: &TokioDecoder, tree: &decoder::model::TaskTree, pid: 
         let node = tree.node(id).expect("node for its own id");
         assert_eq!(node.kind, TaskKind::AsyncTask, "task {id:?} not async");
         match &node.state {
-            TaskState::Blocked { on: BlockReason::Timer } => timer_parked += 1,
-            TaskState::Blocked { on: BlockReason::Channel { .. } } => channel_parked += 1,
+            TaskState::Blocked {
+                on: BlockReason::Timer,
+            } => timer_parked += 1,
+            TaskState::Blocked {
+                on: BlockReason::Channel { .. },
+            } => channel_parked += 1,
             _ => {}
         }
         if node.name == "nested_parent" {
-            let stack = decoder.logical_stack(&view, id).expect("nested logical stack");
+            let stack = decoder
+                .logical_stack(&view, id)
+                .expect("nested logical stack");
             let names: Vec<&str> = stack.iter().map(|f| f.display_name.as_str()).collect();
             assert!(
                 names.contains(&"nested_parent") && names.contains(&"inner_leaf"),
@@ -304,7 +317,10 @@ fn assert_decoded(decoder: &TokioDecoder, tree: &decoder::model::TaskTree, pid: 
             );
             // The innermost suspend is a channel receive.
             assert_eq!(
-                stack.last().and_then(|f| f.suspend.as_ref()).map(|s| s.kind.clone()),
+                stack
+                    .last()
+                    .and_then(|f| f.suspend.as_ref())
+                    .map(|s| s.kind.clone()),
                 Some(SuspendKind::ChannelRecv),
                 "nested leaf must be a channel recv; stack {names:?}"
             );
@@ -325,9 +341,18 @@ fn assert_decoded(decoder: &TokioDecoder, tree: &decoder::model::TaskTree, pid: 
         tree.children(joiner_id).len()
     );
 
-    assert!(nested_multi_frame, "nested_parent must have a multi-frame logical stack");
-    assert!(timer_parked >= 1, "expected >= 1 timer-parked task (sleeper)");
-    assert!(channel_parked >= 1, "expected >= 1 channel-parked task (nested_parent)");
+    assert!(
+        nested_multi_frame,
+        "nested_parent must have a multi-frame logical stack"
+    );
+    assert!(
+        timer_parked >= 1,
+        "expected >= 1 timer-parked task (sleeper)"
+    );
+    assert!(
+        channel_parked >= 1,
+        "expected >= 1 channel-parked task (nested_parent)"
+    );
 }
 
 fn published_names(published: &[Published]) -> Vec<&str> {

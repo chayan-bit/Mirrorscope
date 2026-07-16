@@ -71,15 +71,11 @@ pub fn static_tls_address(
     match variant {
         TlsVariant::VariantI => {
             let tcb = align_up(AARCH64_TCB_SIZE, tls_align.max(1));
-            thread_pointer
-                .wrapping_add(tcb)
-                .wrapping_add(tls_offset)
+            thread_pointer.wrapping_add(tcb).wrapping_add(tls_offset)
         }
         TlsVariant::VariantII => {
             let block = align_up(block_size, tls_align.max(1));
-            thread_pointer
-                .wrapping_sub(block)
-                .wrapping_add(tls_offset)
+            thread_pointer.wrapping_sub(block).wrapping_add(tls_offset)
         }
     }
 }

@@ -56,7 +56,11 @@ impl GoroutineDecoder {
     }
 
     /// Find the goroutine a [`TaskId`] refers to, re-reading from `view`.
-    fn goroutine(&self, view: &dyn ProcessView, task: TaskId) -> Result<GoroutineInfo, DecoderError> {
+    fn goroutine(
+        &self,
+        view: &dyn ProcessView,
+        task: TaskId,
+    ) -> Result<GoroutineInfo, DecoderError> {
         walk_goroutines(view, &self.layout)?
             .into_iter()
             .find(|g| g.goid == task.raw() as i64)
@@ -142,7 +146,10 @@ fn node_for(g: &GoroutineInfo, live: &HashSet<i64>) -> TaskNode {
 }
 
 /// The physical stack of the OS thread a running goroutine occupies.
-fn running_stack(view: &dyn ProcessView, thread: ThreadId) -> Result<Vec<LogicalFrame>, DecoderError> {
+fn running_stack(
+    view: &dyn ProcessView,
+    thread: ThreadId,
+) -> Result<Vec<LogicalFrame>, DecoderError> {
     let frames = view
         .physical_frames(thread)
         .map_err(|_| DecoderError::UnknownThread(thread))?;
@@ -336,7 +343,9 @@ mod tests {
         );
         assert_eq!(
             tree.node(TaskId::new(3)).expect("g3").state,
-            TaskState::Blocked { on: BlockReason::Timer }
+            TaskState::Blocked {
+                on: BlockReason::Timer
+            }
         );
     }
 

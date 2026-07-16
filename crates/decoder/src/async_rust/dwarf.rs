@@ -72,8 +72,9 @@ pub fn extract(bytes: &[u8]) -> Result<DwarfExtract, AsyncDecodeError> {
     };
     let load = |id: gimli::SectionId| -> Result<Cow<[u8]>, gimli::Error> {
         Ok(match object::Object::section_by_name(&file, id.name()) {
-            Some(section) => object::ObjectSection::uncompressed_data(&section)
-                .unwrap_or(Cow::Borrowed(&[][..])),
+            Some(section) => {
+                object::ObjectSection::uncompressed_data(&section).unwrap_or(Cow::Borrowed(&[][..]))
+            }
             None => Cow::Borrowed(&[][..]),
         })
     };
@@ -160,7 +161,14 @@ fn build_index(
     let mut coroutines = HashSet::new();
     let mut tree = unit.entries_tree(None).map_err(dwarf_err)?;
     let root = tree.root().map_err(dwarf_err)?;
-    walk_names(dwarf, unit, root, &mut Vec::new(), &mut names, &mut coroutines)?;
+    walk_names(
+        dwarf,
+        unit,
+        root,
+        &mut Vec::new(),
+        &mut names,
+        &mut coroutines,
+    )?;
     Ok(UnitIndex { names, coroutines })
 }
 
@@ -174,11 +182,7 @@ fn walk_names(
 ) -> Result<(), AsyncDecodeError> {
     let (tag, offset, local) = {
         let entry = node.entry();
-        (
-            entry.tag(),
-            entry.offset(),
-            die_name(dwarf, unit, entry)?,
-        )
+        (entry.tag(), entry.offset(), die_name(dwarf, unit, entry)?)
     };
 
     let mut pushed = false;
@@ -254,7 +258,11 @@ fn build_from_variant_part(
     type_name: String,
     byte_size: u64,
 ) -> Result<Option<AsyncFnLayout>, AsyncDecodeError> {
-    let discr_ref = match vp.entry().attr_value(gimli::DW_AT_discr).map_err(dwarf_err)? {
+    let discr_ref = match vp
+        .entry()
+        .attr_value(gimli::DW_AT_discr)
+        .map_err(dwarf_err)?
+    {
         Some(gimli::AttributeValue::UnitRef(r)) => r,
         // No explicit discriminant (niche layout): decline this coroutine.
         _ => return Ok(None),
@@ -572,7 +580,11 @@ fn die_name(
 
 /// A DIE attribute read as an unsigned constant.
 fn udata(entry: &gimli::DebuggingInformationEntry<Reader>, attr: gimli::DwAt) -> Option<u64> {
-    entry.attr(attr).ok().flatten().and_then(|a| a.udata_value())
+    entry
+        .attr(attr)
+        .ok()
+        .flatten()
+        .and_then(|a| a.udata_value())
 }
 
 /// Join a namespace path and a local name into a qualified type name.
@@ -591,7 +603,10 @@ mod tests {
     #[test]
     fn qualify_joins_namespace_path() {
         assert_eq!(
-            qualify(&["probe".to_string(), "sleeper".to_string()], "{async_fn_env#0}"),
+            qualify(
+                &["probe".to_string(), "sleeper".to_string()],
+                "{async_fn_env#0}"
+            ),
             "probe::sleeper::{async_fn_env#0}"
         );
         assert_eq!(qualify(&[], "Sleep"), "Sleep");

@@ -80,7 +80,9 @@ pub fn load_layout(image: &[u8]) -> Result<GoLayout, GoDecodeError> {
 
 /// Fall back to the vendored offset table, keyed by the binary's embedded Go
 /// version string.
-fn resolve_vendored(image: &[u8]) -> Result<(GStructOffsets, Option<u64>, LayoutSource), GoDecodeError> {
+fn resolve_vendored(
+    image: &[u8],
+) -> Result<(GStructOffsets, Option<u64>, LayoutSource), GoDecodeError> {
     let version = GoVersion::detect_in_bytes(image).ok_or_else(|| {
         GoDecodeError::LayoutUnresolved("no DWARF offsets and no embedded go version".to_string())
     })?;
@@ -90,5 +92,9 @@ fn resolve_vendored(image: &[u8]) -> Result<(GStructOffsets, Option<u64>, Layout
             version.major, version.minor
         ))
     })?;
-    Ok((g, vendored_m_procid(version), LayoutSource::Vendored(version)))
+    Ok((
+        g,
+        vendored_m_procid(version),
+        LayoutSource::Vendored(version),
+    ))
 }

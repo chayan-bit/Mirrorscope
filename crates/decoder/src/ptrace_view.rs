@@ -194,10 +194,8 @@ impl ProcessView for PtraceProcessView {
         // Validate the thread belongs to this view before touching ptrace.
         self.thread_view(thread)?;
         let tid = thread.0 as i32;
-        read_thread_pointer(tid).map_err(|reason| DecoderError::RegisterReadFailed {
-            thread,
-            reason,
-        })
+        read_thread_pointer(tid)
+            .map_err(|reason| DecoderError::RegisterReadFailed { thread, reason })
     }
 
     fn executable_base(&self) -> Option<u64> {

@@ -94,8 +94,10 @@ pub fn classify_leaf(type_name: &str) -> LeafClass {
     // matters (channel receivers mention "Recv", timers mention "Sleep").
     if contains_any(type_name, &["time::sleep::Sleep", "time::Sleep", "Timeout"]) {
         LeafClass::new(SuspendKind::Timer, WakeCause::Timer, BlockReason::Timer)
-    } else if contains_any(type_name, &["Recv", "channel", "mpsc", "oneshot", "broadcast", "watch"])
-    {
+    } else if contains_any(
+        type_name,
+        &["Recv", "channel", "mpsc", "oneshot", "broadcast", "watch"],
+    ) {
         let detail = Some(short_name(type_name));
         LeafClass::new(
             SuspendKind::ChannelRecv,
@@ -106,8 +108,15 @@ pub fn classify_leaf(type_name: &str) -> LeafClass {
         )
     } else if contains_any(type_name, &["Mutex", "RwLock", "Semaphore", "Barrier"]) {
         let detail = Some(short_name(type_name));
-        LeafClass::new(SuspendKind::Lock, WakeCause::Manual, BlockReason::Lock { detail })
-    } else if contains_any(type_name, &["TcpStream", "net::", "io::", "AsyncFd", "poll_read"]) {
+        LeafClass::new(
+            SuspendKind::Lock,
+            WakeCause::Manual,
+            BlockReason::Lock { detail },
+        )
+    } else if contains_any(
+        type_name,
+        &["TcpStream", "net::", "io::", "AsyncFd", "poll_read"],
+    ) {
         LeafClass::new(
             SuspendKind::Io,
             WakeCause::Io {
@@ -163,7 +172,10 @@ mod tests {
 
     #[test]
     fn running_bit_is_running() {
-        assert_eq!(classify_header_state(bits::RUNNING | (3 << 6)), TaskState::Running);
+        assert_eq!(
+            classify_header_state(bits::RUNNING | (3 << 6)),
+            TaskState::Running
+        );
     }
 
     #[test]
@@ -198,8 +210,14 @@ mod tests {
 
     #[test]
     fn variant_maps_to_state() {
-        assert_eq!(state_from_variant(VariantKind::Unresumed), TaskState::Runnable);
-        assert_eq!(state_from_variant(VariantKind::Returned), TaskState::Completed);
+        assert_eq!(
+            state_from_variant(VariantKind::Unresumed),
+            TaskState::Runnable
+        );
+        assert_eq!(
+            state_from_variant(VariantKind::Returned),
+            TaskState::Completed
+        );
         assert_eq!(
             state_from_variant(VariantKind::Suspend(0)),
             TaskState::Blocked {

@@ -17,8 +17,8 @@ use crate::process_view::ProcessView;
 
 use super::enumerate::EnumerationPlan;
 use super::layout::AsyncLayouts;
-use super::rustc_version::RustcVersion;
 use super::roots::TaskRoot;
+use super::rustc_version::RustcVersion;
 use super::{decode, load_layouts, AsyncDecodeError};
 
 /// Upper bound on total tasks produced, guarding against a cyclic fan-out.
@@ -144,16 +144,19 @@ impl TokioDecoder {
         if !self.roots.is_empty() {
             return Ok(self.roots.clone());
         }
-        let plan = self.plan.as_ref().ok_or_else(|| DecoderError::NotApplicable {
-            reason: "no task roots and no enumeration plan (target outside the verified \
+        let plan = self
+            .plan
+            .as_ref()
+            .ok_or_else(|| DecoderError::NotApplicable {
+                reason: "no task roots and no enumeration plan (target outside the verified \
                      tokio-enumeration window; see async_rust::enumerate)"
-                .to_string(),
-        })?;
-        let roots = plan
-            .enumerate_roots(view, &self.layouts)
-            .map_err(|e| DecoderError::NotApplicable {
-                reason: format!("live tokio task enumeration declined: {e}"),
+                    .to_string(),
             })?;
+        let roots =
+            plan.enumerate_roots(view, &self.layouts)
+                .map_err(|e| DecoderError::NotApplicable {
+                    reason: format!("live tokio task enumeration declined: {e}"),
+                })?;
         if roots.is_empty() {
             return Err(DecoderError::NotApplicable {
                 reason: "tokio runtime present but no decodable spawned tasks were found"
@@ -180,9 +183,12 @@ impl TokioDecoder {
                 reason: "task fan-out exceeded MAX_TASKS; layout likely misresolved".to_string(),
             });
         }
-        let layout = self.layouts.get(type_name).ok_or_else(|| DecoderError::NotApplicable {
-            reason: format!("no coroutine layout for task type {type_name}"),
-        })?;
+        let layout = self
+            .layouts
+            .get(type_name)
+            .ok_or_else(|| DecoderError::NotApplicable {
+                reason: format!("no coroutine layout for task type {type_name}"),
+            })?;
         let state = decode::task_state(view, base, layout, &self.layouts, header_addr)?;
         let wake = decode::wake_cause(view, base, layout, &self.layouts)?;
         out.push(DecodedNode {
@@ -271,7 +277,10 @@ impl SemanticDecoder for TokioDecoder {
 /// A display name for a task from its coroutine type: the enclosing `async fn`
 /// name, e.g. `sleeper` from `probe::sleeper::{async_fn_env#0}`.
 fn short_name(type_name: &str) -> String {
-    let head = type_name.split("::{async_fn_env").next().unwrap_or(type_name);
+    let head = type_name
+        .split("::{async_fn_env")
+        .next()
+        .unwrap_or(type_name);
     head.rsplit("::").next().unwrap_or(head).to_string()
 }
 
@@ -306,11 +315,14 @@ mod tests {
         fn read_memory(&self, addr: u64, len: usize) -> Result<Vec<u8>, DecoderError> {
             (0..len as u64)
                 .map(|i| {
-                    self.bytes.get(&(addr + i)).copied().ok_or(DecoderError::MemoryReadFailed {
-                        addr,
-                        len,
-                        reason: "unmapped".to_string(),
-                    })
+                    self.bytes
+                        .get(&(addr + i))
+                        .copied()
+                        .ok_or(DecoderError::MemoryReadFailed {
+                            addr,
+                            len,
+                            reason: "unmapped".to_string(),
+                        })
                 })
                 .collect()
         }
@@ -389,7 +401,7 @@ mod tests {
         let mut mem = FakeMemory::new();
         mem.put_u8(0x1000 + 120, 3); // sleeper parked
         mem.put_u8(0x2000 + 288, 3); // joiner parked
-        // joiner's two inline sleepers, both parked:
+                                     // joiner's two inline sleepers, both parked:
         mem.put_u8(0x2000 + 120, 3);
         mem.put_u8(0x2000 + 128 + 120, 3);
         let dec = decoder(vec![
@@ -405,27 +417,45 @@ mod tests {
         // sleeper root is timer-blocked.
         assert_eq!(
             tree.node(TaskId::new(1)).expect("root node").state,
-            TaskState::Blocked { on: BlockReason::Timer }
+            TaskState::Blocked {
+                on: BlockReason::Timer
+            }
         );
-        assert_eq!(tree.node(TaskId::new(1)).expect("root node").name, "sleeper");
+        assert_eq!(
+            tree.node(TaskId::new(1)).expect("root node").name,
+            "sleeper"
+        );
     }
 
     #[test]
     fn logical_stack_and_wake_for_known_task() {
         let mut mem = FakeMemory::new();
         mem.put_u8(0x1000 + 120, 3);
-        let dec = decoder(vec![TaskRoot::new(1, 0x1000, "p::sleeper::{async_fn_env#0}")]);
+        let dec = decoder(vec![TaskRoot::new(
+            1,
+            0x1000,
+            "p::sleeper::{async_fn_env#0}",
+        )]);
         let stack = dec.logical_stack(&mem, TaskId::new(1)).expect("stack");
         assert!(!stack.is_empty());
-        assert_eq!(dec.wake_cause(&mem, TaskId::new(1)).expect("wake"), WakeCause::Timer);
+        assert_eq!(
+            dec.wake_cause(&mem, TaskId::new(1)).expect("wake"),
+            WakeCause::Timer
+        );
     }
 
     #[test]
     fn unknown_task_errors() {
         let mut mem = FakeMemory::new();
         mem.put_u8(0x1000 + 120, 3);
-        let dec = decoder(vec![TaskRoot::new(1, 0x1000, "p::sleeper::{async_fn_env#0}")]);
-        let err = dec.logical_stack(&mem, TaskId::new(99)).expect_err("no such task");
+        let dec = decoder(vec![TaskRoot::new(
+            1,
+            0x1000,
+            "p::sleeper::{async_fn_env#0}",
+        )]);
+        let err = dec
+            .logical_stack(&mem, TaskId::new(99))
+            .expect_err("no such task");
         assert!(matches!(err, DecoderError::UnknownTask(_)));
     }
 
@@ -433,8 +463,15 @@ mod tests {
     fn locals_validate_task_but_are_empty() {
         let mut mem = FakeMemory::new();
         mem.put_u8(0x1000 + 120, 3);
-        let dec = decoder(vec![TaskRoot::new(1, 0x1000, "p::sleeper::{async_fn_env#0}")]);
+        let dec = decoder(vec![TaskRoot::new(
+            1,
+            0x1000,
+            "p::sleeper::{async_fn_env#0}",
+        )]);
         let stack = dec.logical_stack(&mem, TaskId::new(1)).expect("stack");
-        assert!(dec.locals_at(&mem, TaskId::new(1), &stack[0]).expect("known").is_empty());
+        assert!(dec
+            .locals_at(&mem, TaskId::new(1), &stack[0])
+            .expect("known")
+            .is_empty());
     }
 }

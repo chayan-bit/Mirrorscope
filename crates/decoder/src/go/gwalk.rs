@@ -55,9 +55,7 @@ pub struct GoroutineInfo {
 /// Read a little-endian `u64` from the target at `addr`.
 fn read_u64(view: &dyn ProcessView, addr: u64) -> Result<u64, DecoderError> {
     let bytes = view.read_memory(addr, 8)?;
-    let arr: [u8; 8] = bytes
-        .try_into()
-        .map_err(|_| short_read(addr, 8))?;
+    let arr: [u8; 8] = bytes.try_into().map_err(|_| short_read(addr, 8))?;
     Ok(u64::from_le_bytes(arr))
 }
 
@@ -83,7 +81,10 @@ fn short_read(addr: u64, len: usize) -> DecoderError {
 }
 
 /// Read the `runtime.allgs` slice header and return `(data_ptr, len)`.
-fn read_allgs_header(view: &dyn ProcessView, layout: &GoLayout) -> Result<(u64, u64), DecoderError> {
+fn read_allgs_header(
+    view: &dyn ProcessView,
+    layout: &GoLayout,
+) -> Result<(u64, u64), DecoderError> {
     let allgs = layout.allgs_addr + layout.load_bias;
     let data = read_u64(view, allgs)?;
     let len = read_u64(view, allgs + layout.slice_len_offset())?;
@@ -307,7 +308,12 @@ mod tests {
                 }
             }
         );
-        assert_eq!(gs[2].state, TaskState::Blocked { on: BlockReason::Timer });
+        assert_eq!(
+            gs[2].state,
+            TaskState::Blocked {
+                on: BlockReason::Timer
+            }
+        );
         assert_eq!(gs[1].parent_goid, Some(1));
         assert_eq!(gs[2].wait_reason_str, "sleep");
     }

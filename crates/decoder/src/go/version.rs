@@ -97,7 +97,10 @@ mod tests {
 
     #[test]
     fn parses_full_go_version() {
-        assert_eq!(GoVersion::parse("go1.24.13"), Some(GoVersion::new(1, 24, 13)));
+        assert_eq!(
+            GoVersion::parse("go1.24.13"),
+            Some(GoVersion::new(1, 24, 13))
+        );
     }
 
     #[test]

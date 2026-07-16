@@ -38,11 +38,13 @@ pub struct RawTask {
 /// Read a little-endian `u64` from the target at `addr`.
 fn read_u64(view: &dyn ProcessView, addr: u64) -> Result<u64, DecoderError> {
     let bytes = view.read_memory(addr, 8)?;
-    let arr: [u8; 8] = bytes.try_into().map_err(|_| DecoderError::MemoryReadFailed {
-        addr,
-        len: 8,
-        reason: "short read".to_string(),
-    })?;
+    let arr: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| DecoderError::MemoryReadFailed {
+            addr,
+            len: 8,
+            reason: "short read".to_string(),
+        })?;
     Ok(u64::from_le_bytes(arr))
 }
 
@@ -178,11 +180,14 @@ mod tests {
         fn read_memory(&self, addr: u64, len: usize) -> Result<Vec<u8>, DecoderError> {
             (0..len as u64)
                 .map(|i| {
-                    self.bytes.get(&(addr + i)).copied().ok_or(DecoderError::MemoryReadFailed {
-                        addr,
-                        len,
-                        reason: "unmapped".to_string(),
-                    })
+                    self.bytes
+                        .get(&(addr + i))
+                        .copied()
+                        .ok_or(DecoderError::MemoryReadFailed {
+                            addr,
+                            len,
+                            reason: "unmapped".to_string(),
+                        })
                 })
                 .collect()
         }
@@ -223,7 +228,10 @@ mod tests {
             if shard_head[s] == 0 {
                 shard_head[s] = header;
             } else {
-                mem.put_u64(shard_prev[s] + trailer_offset + l.trailer_owned_next, header);
+                mem.put_u64(
+                    shard_prev[s] + trailer_offset + l.trailer_owned_next,
+                    header,
+                );
             }
             mem.put_u64(header + trailer_offset + l.trailer_owned_next, 0);
             shard_prev[s] = header;
@@ -239,12 +247,20 @@ mod tests {
         let l = layout();
         let mut mem = FakeMemory::new();
         let ctx = 0x1000;
-        build(&mut mem, &l, ctx, &[(0x10000, 0x9000, 0), (0x20000, 0x9000, 1)], 4);
+        build(
+            &mut mem,
+            &l,
+            ctx,
+            &[(0x10000, 0x9000, 0), (0x20000, 0x9000, 1)],
+            4,
+        );
         let mut out = Vec::new();
         let found = walk_context(&mem, ctx, &l, &mut out).expect("walk");
         assert!(found);
         assert_eq!(out.len(), 2);
-        assert!(out.iter().any(|t| t.header == 0x10000 && t.future == 0x10000 + l.future_offset));
+        assert!(out
+            .iter()
+            .any(|t| t.header == 0x10000 && t.future == 0x10000 + l.future_offset));
         assert!(out.iter().any(|t| t.header == 0x20000));
     }
 
@@ -257,7 +273,11 @@ mod tests {
             &mut mem,
             &l,
             ctx,
-            &[(0x20000, 0x9000, 0), (0x21000, 0x9000, 0), (0x22000, 0x9000, 0)],
+            &[
+                (0x20000, 0x9000, 0),
+                (0x21000, 0x9000, 0),
+                (0x22000, 0x9000, 0),
+            ],
             1,
         );
         let mut out = Vec::new();
