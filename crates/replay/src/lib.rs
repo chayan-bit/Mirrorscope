@@ -27,6 +27,10 @@ mod checkpoint_select;
 // ptrace-free so its correctness is unit-tested on the macOS dev host.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod watchpoint;
+// Schedule-enforcement portable core: the recorded-tid ↔ live-pid remapping
+// table + the multi-threaded-trace detector, unit-tested on the macOS host.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod schedule;
 
 #[cfg(target_os = "linux")]
 mod checkpoint;
@@ -34,6 +38,8 @@ mod checkpoint;
 mod error;
 #[cfg(target_os = "linux")]
 mod inject;
+#[cfg(target_os = "linux")]
+mod mt;
 #[cfg(target_os = "linux")]
 mod regs;
 #[cfg(target_os = "linux")]

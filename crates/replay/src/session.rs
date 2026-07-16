@@ -11,7 +11,7 @@ use std::thread::JoinHandle;
 
 use nix::sys::ptrace;
 use nix::sys::signal::Signal;
-use nix::sys::wait::{waitpid, WaitStatus};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 
 use recorder::capture::payload::{SyscallEnter, SyscallExit};
@@ -39,22 +39,31 @@ pub enum ExitOutcome {
 }
 
 /// A driven replay of a recorded target.
+///
+/// Fields the multi-threaded driver in [`crate::mt`] reads or updates are
+/// `pub(crate)`; single-threaded-only bookkeeping stays private to this module.
 pub struct ReplaySession {
-    pid: Pid,
+    pub(crate) pid: Pid,
     cmdline: Cmdline,
-    records: Vec<Record>,
-    cursor: usize,
-    current_seq: Option<u64>,
+    pub(crate) records: Vec<Record>,
+    pub(crate) cursor: usize,
+    pub(crate) current_seq: Option<u64>,
     pending: Option<Pending>,
     resume_signal: Option<Signal>,
-    last_regs: Option<Registers>,
-    finished: Option<ExitOutcome>,
+    pub(crate) last_regs: Option<Registers>,
+    pub(crate) finished: Option<ExitOutcome>,
     checkpoint_interval: u64,
     checkpoints: Vec<CheckpointInfo>,
-    watchpoint: Option<Watchpoint>,
-    watch_hits: Vec<WatchHit>,
-    last_value: Option<Vec<u8>>,
-    unwinder: Option<RemoteUnwinder>,
+    pub(crate) watchpoint: Option<Watchpoint>,
+    pub(crate) watch_hits: Vec<WatchHit>,
+    pub(crate) last_value: Option<Vec<u8>>,
+    pub(crate) unwinder: Option<RemoteUnwinder>,
+    /// Whether the trace carries a recorded single-core thread schedule that
+    /// must be enforced (see [`crate::schedule::trace_is_multithreaded`]).
+    multithreaded: bool,
+    /// Live thread set + tid remapping, present only while a multi-threaded
+    /// replay is in flight; rebuilt on every respawn.
+    pub(crate) mt: Option<crate::mt::MtState>,
     stdout: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
     stderr: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
     _child: Child,
@@ -71,10 +80,10 @@ struct Pending {
 /// re-arm the CPU debug registers after every checkpoint restore or respawn
 /// (debug registers are not inherited across `fork`).
 #[derive(Debug, Clone, Copy)]
-struct Watchpoint {
-    addr: u64,
-    len: u8,
-    kind: WatchKind,
+pub(crate) struct Watchpoint {
+    pub(crate) addr: u64,
+    pub(crate) len: u8,
+    pub(crate) kind: WatchKind,
 }
 
 /// Where a `run_to`/`restore_to` should resume from: a checkpoint index (and
@@ -93,6 +102,7 @@ impl ReplaySession {
         let reader = TraceReader::open(BufReader::new(file))?;
         let cmdline = reader.cmdline().cloned().ok_or(ReplayError::NoCmdline)?;
         let records = reader.collect::<Result<Vec<_>, _>>()?;
+        let multithreaded = crate::schedule::trace_is_multithreaded(&records);
 
         let mut child = spawn_traced(&cmdline.program, &cmdline.args)?;
         let pid = Pid::from_raw(child.id() as i32);
@@ -120,10 +130,22 @@ impl ReplaySession {
             watch_hits: Vec::new(),
             last_value: None,
             unwinder: None,
+            multithreaded,
+            mt: None,
             stdout,
             stderr,
             _child: child,
         })
+    }
+
+    /// The current live pid of the main tracee (the recorded leader). The DAP
+    /// backend needs this to address the process it is debugging.
+    ///
+    /// NOTE: this value changes whenever the session respawns from entry or
+    /// restores a checkpoint (a fresh forked/spawned process gets a new pid), so
+    /// callers must re-read it after any `run_to`/`restore_to`, never cache it.
+    pub fn pid(&self) -> i32 {
+        self.pid.as_raw()
     }
 
     /// Take a fork-snapshot checkpoint every `interval` trace-sequence units of
@@ -225,10 +247,23 @@ impl ReplaySession {
     /// session re-arms automatically after any checkpoint restore or respawn.
     pub fn watch(&mut self, addr: u64, len: u8, kind: WatchKind) -> Result<(), ReplayError> {
         watchpoint::validate(addr, len)?;
-        watchpoint_hw::arm(self.pid, addr, len, kind)?;
+        // Debug registers are per-thread, so a multi-threaded replay must arm
+        // every live thread; a single-threaded one has only the leader.
+        for live in self.live_threads() {
+            watchpoint_hw::arm(live, addr, len, kind)?;
+        }
         self.last_value = Some(self.read_memory(addr, usize::from(len))?);
         self.watchpoint = Some(Watchpoint { addr, len, kind });
         Ok(())
+    }
+
+    /// Every live tracee pid the session currently drives: the whole followed
+    /// thread set during a multi-threaded replay, else just the leader.
+    pub(crate) fn live_threads(&self) -> Vec<Pid> {
+        match &self.mt {
+            Some(mt) => mt.live_pids(),
+            None => vec![self.pid],
+        }
     }
 
     /// Disarm the watchpoint and forget the request, leaving any hits collected
@@ -250,6 +285,13 @@ impl ReplaySession {
         if let Some(outcome) = self.finished {
             return Ok(outcome);
         }
+        // Multi-threaded traces are driven by the schedule-enforcing engine,
+        // which understands the v3-only SchedSwitch/ThreadSpawn/ThreadExit kinds
+        // and per-tid syscall injection; single-threaded traces keep the
+        // original single-tracee loop below, byte-for-byte unchanged.
+        if self.multithreaded {
+            return crate::mt::drive(self, stop_at);
+        }
         loop {
             if let (Some(target), Some(current)) = (stop_at, self.current_seq) {
                 if current >= target {
@@ -263,8 +305,8 @@ impl ReplaySession {
                     self.maybe_checkpoint()?;
                 }
                 WaitStatus::Stopped(_, signal) => {
-                    if signal == Signal::SIGTRAP && self.is_watch_hit()? {
-                        self.on_watch_hit()?;
+                    if signal == Signal::SIGTRAP && self.is_watch_hit(self.pid)? {
+                        self.on_watch_hit(self.pid)?;
                     } else {
                         self.on_signal_stop(signal);
                     }
@@ -282,6 +324,15 @@ impl ReplaySession {
     /// configured interval says one is due. Never checkpoints mid-syscall, and
     /// the gap test suppresses duplicates when replay re-covers old ground.
     fn maybe_checkpoint(&mut self) -> Result<(), ReplayError> {
+        // Fork snapshots duplicate only the *calling* thread's task (fork
+        // semantics), so they cannot faithfully snapshot a multi-threaded
+        // tracee. Checkpointing is therefore disabled while a schedule is being
+        // enforced; a correct multi-threaded snapshot needs CRIU, the deferred
+        // Phase-2+ path (issue #5). Backward navigation still works — it
+        // respawns from entry and re-drives, which is fully deterministic.
+        if self.multithreaded {
+            return Ok(());
+        }
         if self.pending.is_some() {
             return Ok(());
         }
@@ -317,6 +368,7 @@ impl ReplaySession {
         self.pending = None;
         self.resume_signal = None;
         self.finished = None;
+        self.mt = None;
         self.rearm_watchpoint()?;
         Ok(())
     }
@@ -340,6 +392,7 @@ impl ReplaySession {
         self.resume_signal = None;
         self.last_regs = None;
         self.finished = None;
+        self.mt = None;
         self.rearm_watchpoint()?;
         Ok(())
     }
@@ -437,27 +490,27 @@ impl ReplaySession {
     /// Whether the current `SIGTRAP` stop is a hardware watchpoint hit. Cheap
     /// early-out when no watchpoint is armed, so unrelated `SIGTRAP`s (real
     /// signals, breakpoints) still flow to [`Self::on_signal_stop`].
-    fn is_watch_hit(&self) -> Result<bool, ReplayError> {
+    pub(crate) fn is_watch_hit(&self, pid: Pid) -> Result<bool, ReplayError> {
         if self.watchpoint.is_none() {
             return Ok(false);
         }
-        watchpoint_hw::is_watch_hit(self.pid)
+        watchpoint_hw::is_watch_hit(pid)
     }
 
     /// Service a hardware watchpoint hit: record the pc, backtrace, nearest seq,
     /// and the value at the range, then step over the faulting instruction so
     /// replay continues. The `SIGTRAP` is swallowed (never forwarded), so the
     /// tracee is unaware it was watched.
-    fn on_watch_hit(&mut self) -> Result<(), ReplayError> {
+    pub(crate) fn on_watch_hit(&mut self, pid: Pid) -> Result<(), ReplayError> {
         let Some(wp) = self.watchpoint else {
             return Ok(());
         };
         // Capture pc + backtrace before any step-over so the leaf frame is the
         // writing instruction — on aarch64 the trap precedes the write, and
         // stepping would advance the pc past it.
-        let (pc, backtrace) = self.capture_backtrace()?;
-        self.step_over_watch()?;
-        let new_value = self.read_memory(wp.addr, usize::from(wp.len))?;
+        let (pc, backtrace) = self.capture_backtrace(pid)?;
+        self.step_over_watch(pid)?;
+        let new_value = inject::read_memory(pid, wp.addr, usize::from(wp.len))?;
         let old_value = self.last_value.take();
         self.last_value = Some(new_value.clone());
         self.watch_hits.push(WatchHit {
@@ -473,10 +526,10 @@ impl ReplaySession {
     /// Unwind and symbolize the current tracee's stack. The remote unwinder is
     /// built lazily and cached per-tracee (dropped on restore/respawn), so a
     /// straight scan reloads DWARF once rather than at every hit.
-    fn capture_backtrace(&mut self) -> Result<(u64, Vec<SymbolizedFrame>), ReplayError> {
+    fn capture_backtrace(&mut self, pid: Pid) -> Result<(u64, Vec<SymbolizedFrame>), ReplayError> {
         let mut unwinder = match self.unwinder.take() {
             Some(unwinder) => unwinder,
-            None => RemoteUnwinder::for_pid(self.pid.as_raw())?,
+            None => RemoteUnwinder::for_pid(pid.as_raw())?,
         };
         let regs = unwinder.registers()?;
         let frames = unwinder.backtrace(&regs)?;
@@ -488,8 +541,8 @@ impl ReplaySession {
     /// points past it — just clear the sticky `DR6` status and let the main
     /// loop resume. No instruction is skipped, so adjacent writes each trap.
     #[cfg(target_arch = "x86_64")]
-    fn step_over_watch(&mut self) -> Result<(), ReplayError> {
-        watchpoint_hw::clear_status(self.pid)
+    fn step_over_watch(&mut self, pid: Pid) -> Result<(), ReplayError> {
+        watchpoint_hw::clear_status(pid)
     }
 
     /// aarch64: a watchpoint traps *before* the access completes, so resuming
@@ -497,13 +550,13 @@ impl ReplaySession {
     /// (the write lands during the step), then re-arm before the next
     /// instruction runs so no subsequent write is missed.
     #[cfg(target_arch = "aarch64")]
-    fn step_over_watch(&mut self) -> Result<(), ReplayError> {
+    fn step_over_watch(&mut self, pid: Pid) -> Result<(), ReplayError> {
         let Some(wp) = self.watchpoint else {
             return Ok(());
         };
-        watchpoint_hw::disarm(self.pid)?;
-        ptrace::step(self.pid, None)?;
-        match waitpid(self.pid, None)? {
+        watchpoint_hw::disarm(pid)?;
+        ptrace::step(pid, None)?;
+        match waitpid(pid, Some(WaitPidFlag::__WALL))? {
             WaitStatus::Stopped(_, Signal::SIGTRAP) => {}
             _ => {
                 return Err(ReplayError::Watchpoint {
@@ -511,7 +564,7 @@ impl ReplaySession {
                 })
             }
         }
-        watchpoint_hw::arm(self.pid, wp.addr, wp.len, wp.kind)
+        watchpoint_hw::arm(pid, wp.addr, wp.len, wp.kind)
     }
 
     fn next_record(&mut self) -> Result<Record, ReplayError> {
@@ -542,15 +595,34 @@ impl ReplaySession {
 
 impl Drop for ReplaySession {
     fn drop(&mut self) {
-        if self.finished.is_none() {
-            let _ = ptrace::kill(self.pid);
-            let _ = waitpid(self.pid, None);
+        // Kill and reap every tracee this session owns (EXITKILL only covers
+        // tracer *exit*, not an early drop). A multi-threaded tracee dropped
+        // mid-replay (e.g. after a divergence) may still hold several stopped
+        // worker threads, and a zombie thread-group *leader* is not reapable
+        // until its siblings are reaped — so reap each known pid explicitly with
+        // the leader last, never a blind `waitpid(-1)` loop (which would spin on
+        // a still-stopped snapshot). SIGKILL is unblockable, so all terminate.
+        let mut tracees: Vec<Pid> = match &self.mt {
+            Some(mt) => mt.live_pids(),
+            None => Vec::new(),
+        };
+        if self.finished.is_none() && !tracees.contains(&self.pid) {
+            tracees.push(self.pid);
         }
-        // Fork snapshots are held-stopped children; release them explicitly so
-        // none linger past the session (EXITKILL only covers tracer exit).
+        // Reap sibling threads before the group leader.
+        tracees.sort_by_key(|&pid| pid == self.pid);
+        for &pid in &tracees {
+            let _ = ptrace::kill(pid);
+        }
         for checkpoint in &self.checkpoints {
             let _ = ptrace::kill(checkpoint.snapshot);
-            let _ = waitpid(checkpoint.snapshot, None);
+        }
+        let flags = WaitPidFlag::__WALL;
+        for &pid in &tracees {
+            let _ = waitpid(pid, Some(flags));
+        }
+        for checkpoint in &self.checkpoints {
+            let _ = waitpid(checkpoint.snapshot, Some(flags));
         }
     }
 }

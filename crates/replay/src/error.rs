@@ -46,6 +46,18 @@ pub enum ReplayError {
         /// Syscall number the tracee actually issued.
         found_nr: u64,
     },
+    /// Multi-threaded replay diverged from the recorded single-core schedule:
+    /// the wrong thread hit an instrumented point, a recorded/live tid mapping
+    /// conflicted, or a thread's lifecycle event did not match the trace. The
+    /// schedule-level sibling of [`ReplayError::Diverged`]; carries a tid-aware
+    /// detail string. Never silently reordered — replay honesty is core.
+    #[error("replay schedule diverged at seq {seq}: {detail}")]
+    ScheduleDiverged {
+        /// Sequence number of the record that mismatched.
+        seq: u64,
+        /// Human-readable, tid-aware cause.
+        detail: String,
+    },
     /// A record of an unexpected kind appeared where the tracee state demanded
     /// another (e.g. a signal record at a syscall entry stop).
     #[error("unexpected record kind at seq {seq}: expected {expected}, found {found:?}")]
