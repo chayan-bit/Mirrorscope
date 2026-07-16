@@ -101,8 +101,30 @@ pub(crate) fn fork_snapshot(pid: Pid) -> Result<Pid, ReplayError> {
             })
         }
     }
-
     setup_options(child)?;
+
+    // The parent is stopped at the fork-family *event*-stop, which the kernel
+    // raises before the injected clone() has actually retired back to user
+    // space — its ptrace syscall-tracing state still considers this syscall
+    // in flight. The very next continue therefore produces one more
+    // syscall-stop (the clone's own exit-stop) that belongs to this injected
+    // syscall, not to the recorded trace. It must be reaped *here*: if it
+    // were left for the caller's normal syscall-stop handling, it would be
+    // consumed as if it were the next real syscall's entry — using registers
+    // that (once restored below) look like the *previous*, already-completed
+    // real syscall, which is exactly the checksum-divergence bug this caused
+    // before this reap was added.
+    ptrace::syscall(pid, None)?;
+    match waitpid(pid, None)? {
+        WaitStatus::PtraceSyscall(_) => {}
+        _ => {
+            return Err(ReplayError::Checkpoint {
+                seq: None,
+                reason: "expected the injected clone's own syscall-exit stop",
+            })
+        }
+    }
+
     // Restore the parent exactly, and seat the child at the same boundary.
     regs::restore_full(pid, &saved)?;
     regs::restore_full(child, &saved)?;
