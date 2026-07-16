@@ -16,6 +16,7 @@ fn main() -> ExitCode {
         },
         Some("record") => run_record(&args[1..]),
         Some("replay") => run_replay(&args[1..]),
+        Some("watch") => run_watch(&args[1..]),
         Some("--version") => {
             println!("mirrorscope {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -39,6 +40,7 @@ fn print_usage() {
     eprintln!("  dap                                  serve DAP over stdio");
     eprintln!("  record [-o <trace>] -- <cmd> [args]  record a target (Linux)");
     eprintln!("  replay [-t <trace>] [--to <seq>]     replay a trace (Linux)");
+    eprintln!("  watch <trace> --addr <a> --len <n>   every write to an address (Linux)");
     eprintln!("  --version                            print the version");
 }
 
@@ -165,4 +167,141 @@ fn parse_replay_args(args: &[String]) -> Option<(String, Option<u64>)> {
         }
     }
     Some((trace_path, to))
+}
+
+/// A parsed `watch` request.
+#[cfg(target_os = "linux")]
+struct WatchArgs {
+    trace_path: String,
+    addr: u64,
+    len: u8,
+    reads: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn run_watch(args: &[String]) -> ExitCode {
+    let parsed = match parse_watch_args(args) {
+        Some(parsed) => parsed,
+        None => {
+            eprintln!("usage: mirrorscope watch <trace> --addr <addr> --len <1|2|4|8> [--rw]");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut scan = replay::WatchpointScan::new(
+        std::path::Path::new(&parsed.trace_path),
+        parsed.addr,
+        parsed.len,
+    );
+    if parsed.reads {
+        scan = scan.watch_reads();
+    }
+
+    match scan.run() {
+        Ok(hits) => {
+            report_watch(&hits, parsed.addr, parsed.len);
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("mirrorscope watch: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_watch(_args: &[String]) -> ExitCode {
+    eprintln!("mirrorscope watch: retroactive watchpoints require Linux (ptrace)");
+    ExitCode::FAILURE
+}
+
+/// Print every watchpoint hit: nearest seq, pc, function, file:line, and value.
+#[cfg(target_os = "linux")]
+fn report_watch(hits: &[replay::WatchHit], addr: u64, len: u8) {
+    eprintln!(
+        "{} access(es) to {len} byte(s) at {addr:#x} across history:",
+        hits.len()
+    );
+    for hit in hits {
+        let frame = hit.backtrace.first();
+        let function = frame
+            .and_then(|f| f.function.as_deref())
+            .unwrap_or("<unknown>");
+        let location = frame
+            .and_then(|f| f.file.as_deref().map(|file| (file, f.line)))
+            .map(|(file, line)| match line {
+                Some(line) => format!("{file}:{line}"),
+                None => file.to_owned(),
+            })
+            .unwrap_or_else(|| "<no source>".to_owned());
+        let seq = hit
+            .seq
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "-".to_owned());
+        println!(
+            "  seq {seq}  pc {:#018x}  {function}  ({location})  = {}",
+            hit.pc,
+            format_value(&hit.new_value)
+        );
+    }
+}
+
+/// Render a little-endian byte value as a `0x…` hex integer for display.
+#[cfg(target_os = "linux")]
+fn format_value(bytes: &[u8]) -> String {
+    let mut value: u128 = 0;
+    for (i, byte) in bytes.iter().enumerate() {
+        value |= u128::from(*byte) << (8 * i);
+    }
+    format!("{value:#x}")
+}
+
+/// Parse `<trace> --addr <addr> --len <n> [--rw]`. `--addr` accepts hex
+/// (`0x…`) or decimal; `--len` must be 1, 2, 4, or 8.
+#[cfg(target_os = "linux")]
+fn parse_watch_args(args: &[String]) -> Option<WatchArgs> {
+    let mut trace_path: Option<String> = None;
+    let mut addr: Option<u64> = None;
+    let mut len: Option<u8> = None;
+    let mut reads = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--addr" => {
+                addr = Some(parse_int(args.get(i + 1)?)?);
+                i += 2;
+            }
+            "--len" => {
+                len = Some(args.get(i + 1)?.parse().ok()?);
+                i += 2;
+            }
+            "--rw" => {
+                reads = true;
+                i += 1;
+            }
+            flag if flag.starts_with('-') => return None,
+            _ => {
+                if trace_path.is_some() {
+                    return None;
+                }
+                trace_path = Some(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    Some(WatchArgs {
+        trace_path: trace_path?,
+        addr: addr?,
+        len: len?,
+        reads,
+    })
+}
+
+/// Parse an integer given in hex (`0x…`) or decimal.
+#[cfg(target_os = "linux")]
+fn parse_int(text: &str) -> Option<u64> {
+    match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => text.parse().ok(),
+    }
 }

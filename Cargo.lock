@@ -266,6 +266,7 @@ dependencies = [
  "nix",
  "recorder",
  "thiserror",
+ "unwind",
 ]
 
 [[package]]

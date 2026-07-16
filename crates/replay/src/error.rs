@@ -3,6 +3,8 @@
 use recorder::capture::payload::PayloadError;
 use recorder::trace::{EventKind, TraceError};
 
+use crate::watchpoint::WatchpointError;
+
 /// Errors while launching or driving a replay.
 #[derive(Debug, thiserror::Error)]
 pub enum ReplayError {
@@ -71,4 +73,18 @@ pub enum ReplayError {
     /// Draining the replayed target's piped stdout/stderr failed.
     #[error("failed to read replay output: {0}")]
     Output(std::io::Error),
+    /// A retroactive-watchpoint request was invalid (bad length or alignment).
+    #[error("invalid watchpoint request: {0}")]
+    WatchpointRequest(#[from] WatchpointError),
+    /// Arming or servicing a hardware watchpoint failed. Watchpoint failures are
+    /// hard errors — a debugger that silently fails to watch is worse than one
+    /// that stops.
+    #[error("watchpoint failure: {reason}")]
+    Watchpoint {
+        /// Human-readable cause.
+        reason: &'static str,
+    },
+    /// Unwinding or symbolizing a stack at a watchpoint hit failed.
+    #[error("backtrace at watchpoint hit failed: {0}")]
+    Unwind(#[from] unwind::RemoteError),
 }

@@ -18,11 +18,15 @@
 //! exactly like the recorder's capture backend — except the portable
 //! [`checkpoint_select`] module, which always compiles so its tests run locally.
 
-// Portable checkpoint-selection arithmetic; compiled everywhere so `cargo test`
-// exercises it on non-Linux hosts. Unused (dead) off Linux, where no ptrace
-// driver consumes it.
+// Portable modules; compiled everywhere so `cargo test` exercises them on
+// non-Linux hosts. Unused (dead) off Linux, where no ptrace driver consumes
+// them.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod checkpoint_select;
+// Retroactive-watchpoint core: the encoding math + request validation, kept
+// ptrace-free so its correctness is unit-tested on the macOS dev host.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod watchpoint;
 
 #[cfg(target_os = "linux")]
 mod checkpoint;
@@ -33,7 +37,17 @@ mod inject;
 #[cfg(target_os = "linux")]
 mod regs;
 #[cfg(target_os = "linux")]
+mod scan;
+#[cfg(target_os = "linux")]
 mod session;
+#[cfg(target_os = "linux")]
+mod watchpoint_hw;
+
+// Portable watchpoint vocabulary — usable by any client, on any platform.
+pub use watchpoint::{WatchHit, WatchKind, WatchpointError};
+// Re-export the symbolized-frame type a `WatchHit` backtrace is built from, so
+// consumers need not depend on `unwind` directly.
+pub use unwind::SymbolizedFrame;
 
 #[cfg(target_os = "linux")]
 pub use checkpoint::CheckpointInfo;
@@ -41,5 +55,7 @@ pub use checkpoint::CheckpointInfo;
 pub use error::ReplayError;
 #[cfg(target_os = "linux")]
 pub use regs::Registers;
+#[cfg(target_os = "linux")]
+pub use scan::WatchpointScan;
 #[cfg(target_os = "linux")]
 pub use session::{ExitOutcome, ReplaySession};

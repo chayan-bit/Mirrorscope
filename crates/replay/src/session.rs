@@ -16,12 +16,15 @@ use nix::unistd::Pid;
 
 use recorder::capture::payload::{SyscallEnter, SyscallExit};
 use recorder::trace::{Cmdline, EventKind, Record, TraceError, TraceReader};
+use unwind::{RemoteUnwinder, SymbolizedFrame};
 
 use crate::checkpoint::{self, CheckpointInfo};
 use crate::checkpoint_select;
 use crate::error::ReplayError;
 use crate::inject::{self, injection_addr};
 use crate::regs::{self, Registers};
+use crate::watchpoint::{self, WatchHit, WatchKind};
+use crate::watchpoint_hw;
 
 /// How the replayed tracee left off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +51,10 @@ pub struct ReplaySession {
     finished: Option<ExitOutcome>,
     checkpoint_interval: u64,
     checkpoints: Vec<CheckpointInfo>,
+    watchpoint: Option<Watchpoint>,
+    watch_hits: Vec<WatchHit>,
+    last_value: Option<Vec<u8>>,
+    unwinder: Option<RemoteUnwinder>,
     stdout: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
     stderr: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
     _child: Child,
@@ -58,6 +65,16 @@ struct Pending {
     /// Destination buffer for injected results, when this syscall is one whose
     /// result must be fed from the trace; `None` for real syscalls.
     inject_addr: Option<u64>,
+}
+
+/// The active retroactive-watchpoint request, remembered so the session can
+/// re-arm the CPU debug registers after every checkpoint restore or respawn
+/// (debug registers are not inherited across `fork`).
+#[derive(Debug, Clone, Copy)]
+struct Watchpoint {
+    addr: u64,
+    len: u8,
+    kind: WatchKind,
 }
 
 /// Where a `run_to`/`restore_to` should resume from: a checkpoint index (and
@@ -99,6 +116,10 @@ impl ReplaySession {
             finished: None,
             checkpoint_interval: 0,
             checkpoints: Vec::new(),
+            watchpoint: None,
+            watch_hits: Vec::new(),
+            last_value: None,
+            unwinder: None,
             stdout,
             stderr,
             _child: child,
@@ -195,6 +216,36 @@ impl ReplaySession {
         join_drain(self.stderr.take())
     }
 
+    /// Arm a retroactive watchpoint on `len` bytes (1, 2, 4, or 8) at `addr`.
+    ///
+    /// Once armed, every access of `kind` to the range during forward replay is
+    /// recorded as a [`WatchHit`] (drain them with [`Self::take_watch_hits`]).
+    /// The request is validated (supported length, natural alignment) and the
+    /// CPU debug registers are armed on the current tracee immediately; the
+    /// session re-arms automatically after any checkpoint restore or respawn.
+    pub fn watch(&mut self, addr: u64, len: u8, kind: WatchKind) -> Result<(), ReplayError> {
+        watchpoint::validate(addr, len)?;
+        watchpoint_hw::arm(self.pid, addr, len, kind)?;
+        self.last_value = Some(self.read_memory(addr, usize::from(len))?);
+        self.watchpoint = Some(Watchpoint { addr, len, kind });
+        Ok(())
+    }
+
+    /// Disarm the watchpoint and forget the request, leaving any hits collected
+    /// so far intact. A no-op if none is armed.
+    pub fn clear_watch(&mut self) -> Result<(), ReplayError> {
+        if self.watchpoint.take().is_some() && self.finished.is_none() {
+            watchpoint_hw::disarm(self.pid)?;
+        }
+        self.last_value = None;
+        Ok(())
+    }
+
+    /// Drain every watchpoint hit collected so far, in execution order.
+    pub fn take_watch_hits(&mut self) -> Vec<WatchHit> {
+        std::mem::take(&mut self.watch_hits)
+    }
+
     fn drive(&mut self, stop_at: Option<u64>) -> Result<ExitOutcome, ReplayError> {
         if let Some(outcome) = self.finished {
             return Ok(outcome);
@@ -211,7 +262,13 @@ impl ReplaySession {
                     self.on_syscall_stop()?;
                     self.maybe_checkpoint()?;
                 }
-                WaitStatus::Stopped(_, signal) => self.on_signal_stop(signal),
+                WaitStatus::Stopped(_, signal) => {
+                    if signal == Signal::SIGTRAP && self.is_watch_hit()? {
+                        self.on_watch_hit()?;
+                    } else {
+                        self.on_signal_stop(signal);
+                    }
+                }
                 WaitStatus::Exited(_, code) => return Ok(self.finish(ExitOutcome::Exited(code))),
                 WaitStatus::Signaled(_, sig, _) => {
                     return Ok(self.finish(ExitOutcome::Signaled(sig as i32)))
@@ -260,6 +317,7 @@ impl ReplaySession {
         self.pending = None;
         self.resume_signal = None;
         self.finished = None;
+        self.rearm_watchpoint()?;
         Ok(())
     }
 
@@ -282,6 +340,20 @@ impl ReplaySession {
         self.resume_signal = None;
         self.last_regs = None;
         self.finished = None;
+        self.rearm_watchpoint()?;
+        Ok(())
+    }
+
+    /// Re-arm the CPU debug registers on the current tracee after a restore or
+    /// respawn. Debug registers are not inherited across `fork`, so a freshly
+    /// forked snapshot child or a respawned process starts with them clear; a
+    /// live watchpoint must be re-installed or writes after the jump go unseen.
+    /// The cached remote unwinder is also dropped, as it is bound to the old pid.
+    fn rearm_watchpoint(&mut self) -> Result<(), ReplayError> {
+        self.unwinder = None;
+        if let Some(wp) = self.watchpoint {
+            watchpoint_hw::arm(self.pid, wp.addr, wp.len, wp.kind)?;
+        }
         Ok(())
     }
 
@@ -360,6 +432,86 @@ impl ReplaySession {
             }
         }
         self.resume_signal = Some(signal);
+    }
+
+    /// Whether the current `SIGTRAP` stop is a hardware watchpoint hit. Cheap
+    /// early-out when no watchpoint is armed, so unrelated `SIGTRAP`s (real
+    /// signals, breakpoints) still flow to [`Self::on_signal_stop`].
+    fn is_watch_hit(&self) -> Result<bool, ReplayError> {
+        if self.watchpoint.is_none() {
+            return Ok(false);
+        }
+        watchpoint_hw::is_watch_hit(self.pid)
+    }
+
+    /// Service a hardware watchpoint hit: record the pc, backtrace, nearest seq,
+    /// and the value at the range, then step over the faulting instruction so
+    /// replay continues. The `SIGTRAP` is swallowed (never forwarded), so the
+    /// tracee is unaware it was watched.
+    fn on_watch_hit(&mut self) -> Result<(), ReplayError> {
+        let Some(wp) = self.watchpoint else {
+            return Ok(());
+        };
+        // Capture pc + backtrace before any step-over so the leaf frame is the
+        // writing instruction — on aarch64 the trap precedes the write, and
+        // stepping would advance the pc past it.
+        let (pc, backtrace) = self.capture_backtrace()?;
+        self.step_over_watch()?;
+        let new_value = self.read_memory(wp.addr, usize::from(wp.len))?;
+        let old_value = self.last_value.take();
+        self.last_value = Some(new_value.clone());
+        self.watch_hits.push(WatchHit {
+            seq: self.current_seq,
+            pc,
+            old_value,
+            new_value,
+            backtrace,
+        });
+        Ok(())
+    }
+
+    /// Unwind and symbolize the current tracee's stack. The remote unwinder is
+    /// built lazily and cached per-tracee (dropped on restore/respawn), so a
+    /// straight scan reloads DWARF once rather than at every hit.
+    fn capture_backtrace(&mut self) -> Result<(u64, Vec<SymbolizedFrame>), ReplayError> {
+        let mut unwinder = match self.unwinder.take() {
+            Some(unwinder) => unwinder,
+            None => RemoteUnwinder::for_pid(self.pid.as_raw())?,
+        };
+        let regs = unwinder.registers()?;
+        let frames = unwinder.backtrace(&regs)?;
+        self.unwinder = Some(unwinder);
+        Ok((regs.pc, frames))
+    }
+
+    /// x86-64: a data watchpoint traps *after* the write, so the pc already
+    /// points past it — just clear the sticky `DR6` status and let the main
+    /// loop resume. No instruction is skipped, so adjacent writes each trap.
+    #[cfg(target_arch = "x86_64")]
+    fn step_over_watch(&mut self) -> Result<(), ReplayError> {
+        watchpoint_hw::clear_status(self.pid)
+    }
+
+    /// aarch64: a watchpoint traps *before* the access completes, so resuming
+    /// would re-trap the same instruction forever. Disarm, single-step over it
+    /// (the write lands during the step), then re-arm before the next
+    /// instruction runs so no subsequent write is missed.
+    #[cfg(target_arch = "aarch64")]
+    fn step_over_watch(&mut self) -> Result<(), ReplayError> {
+        let Some(wp) = self.watchpoint else {
+            return Ok(());
+        };
+        watchpoint_hw::disarm(self.pid)?;
+        ptrace::step(self.pid, None)?;
+        match waitpid(self.pid, None)? {
+            WaitStatus::Stopped(_, Signal::SIGTRAP) => {}
+            _ => {
+                return Err(ReplayError::Watchpoint {
+                    reason: "unexpected stop while stepping over a watchpoint hit",
+                })
+            }
+        }
+        watchpoint_hw::arm(self.pid, wp.addr, wp.len, wp.kind)
     }
 
     fn next_record(&mut self) -> Result<Record, ReplayError> {
