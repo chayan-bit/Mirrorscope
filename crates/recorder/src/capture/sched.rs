@@ -52,7 +52,7 @@ use nix::unistd::Pid;
 
 use crate::capture::affinity::pin_to_serialization_cpu;
 use crate::capture::error::{CaptureError, RecordOutcome};
-use crate::capture::payload::{SchedSwitch, ThreadExit, ThreadSpawn};
+use crate::capture::payload::{SchedSwitch, SignalDelivery, ThreadExit, ThreadSpawn};
 use crate::capture::syscall::{enter_event, exit_event, read_syscall_regs, SyscallRegs};
 use crate::capture::timer::{PreemptionTimer, DEFAULT_QUANTUM};
 use crate::trace::{Event, EventKind, TraceWriter};
@@ -206,8 +206,18 @@ impl<'w, W: Write> Scheduler<'w, W> {
 
     /// A syscall-free tracee overran its quantum: stop and reap it so the
     /// scheduler can rotate to another thread.
+    ///
+    /// `kill` can race a thread that exits right at the quantum boundary: the
+    /// kernel has already queued its exit notification, but SIGALRM interrupted
+    /// `waitpid` before it was reaped, so the thread no longer exists to signal
+    /// and `kill` returns `ESRCH`. That is not a capture failure — the pending
+    /// `waitpid` below still reaps the exit — so it is tolerated here and only
+    /// other errors (a real inability to stop the tracee) propagate.
     fn preempt(&mut self, cur: Pid) -> Result<(), CaptureError> {
-        kill(cur, Signal::SIGSTOP)?;
+        match kill(cur, Signal::SIGSTOP) {
+            Ok(()) | Err(Errno::ESRCH) => {}
+            Err(e) => return Err(e.into()),
+        }
         let status = waitpid(cur, Some(WaitPidFlag::__WALL | WaitPidFlag::__WNOTHREAD))?;
         self.handle(status)
     }
@@ -295,7 +305,7 @@ impl<'w, W: Write> Scheduler<'w, W> {
         self.clear_running(pid);
         if sig != Signal::SIGSTOP {
             let ts = self.now();
-            let payload = (sig as i32).to_le_bytes().to_vec();
+            let payload = SignalDelivery { signum: sig as i32 }.encode();
             self.append(Event::new_with_tid(
                 EventKind::Signal,
                 ts,
