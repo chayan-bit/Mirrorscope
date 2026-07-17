@@ -14,7 +14,7 @@ use nix::sys::signal::Signal;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 
-use recorder::capture::payload::{SyscallEnter, SyscallExit};
+use recorder::capture::payload::{SignalDelivery, SyscallEnter, SyscallExit};
 use recorder::trace::{Cmdline, EventKind, Record, TraceError, TraceReader};
 use unwind::{RemoteUnwinder, SymbolizedFrame};
 
@@ -268,9 +268,18 @@ impl ReplaySession {
 
     /// Disarm the watchpoint and forget the request, leaving any hits collected
     /// so far intact. A no-op if none is armed.
+    ///
+    /// Debug registers are per-thread, so this must disarm every live thread
+    /// symmetrically with [`Self::watch`]'s arming — disarming only
+    /// `self.pid` would leave siblings' registers live, and once
+    /// `self.watchpoint` is `None` a later stale SIGTRAP on one of them is no
+    /// longer recognized by [`Self::is_watch_hit`] and gets misreported as an
+    /// ordinary (diverging) stop instead of a watch hit.
     pub fn clear_watch(&mut self) -> Result<(), ReplayError> {
         if self.watchpoint.take().is_some() && self.finished.is_none() {
-            watchpoint_hw::disarm(self.pid)?;
+            for live in self.live_threads() {
+                watchpoint_hw::disarm(live)?;
+            }
         }
         self.last_value = None;
         Ok(())
@@ -308,7 +317,7 @@ impl ReplaySession {
                     if signal == Signal::SIGTRAP && self.is_watch_hit(self.pid)? {
                         self.on_watch_hit(self.pid)?;
                     } else {
-                        self.on_signal_stop(signal);
+                        self.on_signal_stop(signal)?;
                     }
                 }
                 WaitStatus::Exited(_, code) => return Ok(self.finish(ExitOutcome::Exited(code))),
@@ -476,15 +485,26 @@ impl ReplaySession {
         Ok(())
     }
 
-    fn on_signal_stop(&mut self, signal: Signal) {
+    fn on_signal_stop(&mut self, signal: Signal) -> Result<(), ReplayError> {
         self.skip_checkpoints();
         if let Some(record) = self.records.get(self.cursor) {
             if record.event.kind == EventKind::Signal {
+                let recorded = SignalDelivery::decode(&record.event.payload)?;
+                if recorded.signum != signal as i32 {
+                    return Err(ReplayError::ScheduleDiverged {
+                        seq: record.seq,
+                        detail: format!(
+                            "expected delivered signal {}, got {}",
+                            recorded.signum, signal as i32
+                        ),
+                    });
+                }
                 self.current_seq = Some(record.seq);
                 self.cursor += 1;
             }
         }
         self.resume_signal = Some(signal);
+        Ok(())
     }
 
     /// Whether the current `SIGTRAP` stop is a hardware watchpoint hit. Cheap

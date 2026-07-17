@@ -22,7 +22,7 @@ use std::process::Command;
 
 use recorder::capture::record_command;
 use recorder::trace::{Event, EventKind, Record, TraceReader, TraceWriter};
-use replay::{ExitOutcome, ReplayError, ReplaySession};
+use replay::{ExitOutcome, ReplayError, ReplaySession, WatchKind};
 
 const THREADS: usize = 3;
 const CHUNK: usize = 64;
@@ -84,6 +84,53 @@ int main(int argc, char** argv) {
 }
 "#;
 
+/// A second pthreads fixture for the `clear_watch` regression below (H1):
+/// prints the address of a watched global, spawns two workers that each
+/// increment it once and exit, while main spin-waits on their completion
+/// counter (the same spin-only, no-blocking-syscall discipline as [`SOURCE`]).
+///
+/// Deliberately has **no** dependency running the other way (main never
+/// signals the workers to proceed): replay only ever switches threads at a
+/// syscall/spawn/exit boundary, never mid-instruction, so any handshake where
+/// two threads each spin-wait on a memory write only the *other* one can make
+/// (worker waits on main, main waits on workers) can never resolve under
+/// replay — the workers here don't wait on anything, so no such cycle exists.
+/// This gives the test a safe window right after both `ThreadSpawn` records
+/// (both workers registered but not yet resumed at all, so neither has
+/// written the watched global) in which to arm and then clear the watchpoint
+/// — the exact window `clear_watch` must disarm every live thread in, not
+/// just the leader.
+const WATCH_SOURCE: &str = r#"
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#define N 2
+
+static volatile int counter = 0;
+static volatile int done_count = 0;
+
+static void* work(void* p) {
+    (void)p;
+    __atomic_add_fetch(&counter, 1, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&done_count, 1, __ATOMIC_SEQ_CST);
+    syscall(SYS_exit, 0);
+    return 0;
+}
+
+int main(void) {
+    printf("%lu\n", (unsigned long)(uintptr_t)&counter);
+    fflush(stdout);
+    pthread_t t[N];
+    for (int i = 0; i < N; i++) pthread_create(&t[i], 0, work, 0);
+    while (__atomic_load_n(&done_count, __ATOMIC_SEQ_CST) < N) { /* user-space spin */ }
+    return 0;
+}
+"#;
+
 fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "mirrorscope-mt-replay-{}-{}-{tag}",
@@ -99,9 +146,20 @@ fn temp_dir(tag: &str) -> PathBuf {
 
 /// Compile the pthreads target, or `None` if no C compiler is available.
 fn compile_target(dir: &Path) -> Option<PathBuf> {
-    let src = dir.join("mt.c");
-    fs::write(&src, SOURCE).expect("write C source");
-    let bin = dir.join("mt");
+    compile_source(dir, SOURCE, "mt.c", "mt")
+}
+
+/// Compile the `clear_watch` regression fixture, or `None` if no C compiler is
+/// available.
+fn compile_watch_target(dir: &Path) -> Option<PathBuf> {
+    compile_source(dir, WATCH_SOURCE, "mt_watch.c", "mt_watch")
+}
+
+/// Write `source` to `dir/src_name` and compile it into `dir/bin_name`.
+fn compile_source(dir: &Path, source: &str, src_name: &str, bin_name: &str) -> Option<PathBuf> {
+    let src = dir.join(src_name);
+    fs::write(&src, source).expect("write C source");
+    let bin = dir.join(bin_name);
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
     let ok = Command::new(&cc)
         .arg("-O0")
@@ -294,6 +352,88 @@ fn single_threaded_trace_still_replays_through_the_unchanged_path() {
         session.read_stdout().expect("stdout"),
         original,
         "single-threaded replay must inject the original bytes as before"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Regression for the `clear_watch` fix (H1): debug registers are per-thread,
+/// so `clear_watch` must disarm every live thread symmetrically with `watch`'s
+/// arming, not just the leader `self.pid`. Before the fix, a sibling thread's
+/// hardware watchpoint stayed armed after `clear_watch`; once
+/// `self.watchpoint` is `None` the later stale `SIGTRAP` it raises on its
+/// (still-armed) write is no longer recognized by `is_watch_hit` and gets
+/// misreported as an ordinary diverging stop.
+///
+/// Drives replay to the point where both `WATCH_SOURCE` workers have spawned
+/// (so `on_thread_spawn` has armed the watchpoint on each of them too) but
+/// neither has yet written the watched global, clears the watch there, then
+/// lets both workers perform their writes. A pre-fix build fails this test
+/// with `ScheduleDiverged` from the sibling's leaked watchpoint trap; the
+/// fixed build replays to a clean exit.
+#[test]
+fn clear_watch_disarms_every_live_thread_not_just_the_leader() {
+    let dir = temp_dir("clear-watch");
+    let Some(bin) = compile_watch_target(&dir) else {
+        eprintln!("skipping: no C compiler available to build the pthreads target");
+        fs::remove_dir_all(&dir).ok();
+        return;
+    };
+
+    let trace_path = dir.join("mtwatch.mscope");
+    let outcome = record_command(bin.to_str().expect("utf-8"), &[], &trace_path).expect("record");
+    assert_eq!(
+        outcome.exit_code,
+        Some(0),
+        "recorded fixture must exit cleanly"
+    );
+
+    // Probe replay to learn the watched global's address (stable across runs:
+    // both recorder and replay pin the layout with ADDR_NO_RANDOMIZE).
+    let mut probe = ReplaySession::launch(&trace_path).expect("launch probe replay");
+    probe.run_to_end().expect("probe replay to completion");
+    let stdout = probe.read_stdout().expect("read probe stdout");
+    let addr: u64 = String::from_utf8(stdout)
+        .expect("fixture prints utf-8")
+        .trim()
+        .parse()
+        .expect("fixture prints the watched address as a decimal u64");
+    assert_ne!(addr, 0, "the watched global must have a real address");
+
+    // The seq of the last ThreadSpawn record: the earliest point at which both
+    // workers are live and (once watched) armed by `on_thread_spawn`.
+    let (_cmdline, records) = read_records(&trace_path);
+    let last_spawn_seq = records
+        .iter()
+        .filter(|record| record.event.kind == EventKind::ThreadSpawn)
+        .map(|record| record.seq)
+        .max()
+        .expect("fixture must spawn at least one worker thread");
+
+    let mut session = ReplaySession::launch(&trace_path).expect("launch replay");
+    // Arm before any thread has spawned: only the leader is live yet, so this
+    // exercises `on_thread_spawn`'s re-arming of each worker as it appears.
+    session
+        .watch(addr, 4, WatchKind::Write)
+        .expect("arm watch on the leader before any worker spawns");
+    session
+        .step_to(last_spawn_seq)
+        .expect("drive past both worker spawns");
+    session
+        .clear_watch()
+        .expect("disarm the watchpoint on every live thread");
+
+    let exit = session.run_to_end().unwrap_or_else(|err| {
+        panic!(
+            "replay must not diverge after clear_watch: a sibling's stale watchpoint \
+             would fire on its counter write and be misreported as a schedule \
+             divergence, got {err:?}"
+        )
+    });
+    assert_eq!(
+        exit,
+        ExitOutcome::Exited(0),
+        "replay must reach a clean exit once every live thread's watchpoint is disarmed"
     );
 
     fs::remove_dir_all(&dir).ok();
