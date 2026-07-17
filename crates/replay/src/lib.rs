@@ -51,6 +51,9 @@ mod watchpoint_hw;
 
 // Portable watchpoint vocabulary — usable by any client, on any platform.
 pub use watchpoint::{WatchHit, WatchKind, WatchpointError};
+// Portable multi-threaded-trace detector — usable by any client, on any
+// platform, so they need not duplicate the scan (see `dap::replay_backend`).
+pub use schedule::trace_is_multithreaded;
 // Re-export the symbolized-frame type a `WatchHit` backtrace is built from, so
 // consumers need not depend on `unwind` directly.
 pub use unwind::SymbolizedFrame;

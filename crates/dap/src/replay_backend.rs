@@ -40,12 +40,11 @@
 //! Fork snapshots only capture a single live thread (see
 //! `replay::checkpoint`), so the replay engine self-disables checkpointing for
 //! the whole session when the trace records a multi-threaded schedule. This
-//! backend detects that up front from the trace (the same scan
-//! `replay::schedule::trace_is_multithreaded` performs internally, duplicated
-//! here in [`read_trace_meta`] since that helper is private to the replay
-//! crate) and reports it honestly rather than silently: `listCheckpoints`
-//! stays (truthfully) empty, and [`Self::checkpoint_note`] surfaces a one-line
-//! explanation the server emits as an `output` event right after `launch`.
+//! backend detects that up front from the trace via
+//! [`replay::trace_is_multithreaded`] in [`read_trace_meta`] and reports it
+//! honestly rather than silently: `listCheckpoints` stays (truthfully) empty,
+//! and [`Self::checkpoint_note`] surfaces a one-line explanation the server
+//! emits as an `output` event right after `launch`.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -80,9 +79,8 @@ pub struct ReplayBackend {
     exited: Option<i32>,
     /// Whether the trace records a multi-threaded schedule, and so is one the
     /// replay engine self-disables checkpointing for (see the module docs).
-    /// Decided once from the trace at construction — mirrors
-    /// `replay::schedule::trace_is_multithreaded`, which is `pub(crate)` to
-    /// the replay crate.
+    /// Decided once from the trace at construction via
+    /// [`replay::trace_is_multithreaded`].
     multithreaded: bool,
 }
 
@@ -329,27 +327,23 @@ impl DebugBackend for ReplayBackend {
 }
 
 /// Read the ascending seq of every `SyscallExit` record in a trace, plus
-/// whether the trace records a multi-threaded schedule (any `SchedSwitch` /
-/// `ThreadSpawn` / `ThreadExit` record — the same test
-/// `replay::schedule::trace_is_multithreaded` uses internally, duplicated here
-/// since that helper is private to the replay crate).
+/// whether the trace records a multi-threaded schedule — decided by
+/// [`replay::trace_is_multithreaded`], the same scan the replay engine itself
+/// uses to self-disable checkpointing, so this backend never drifts from it.
 fn read_trace_meta(trace_path: &Path) -> Result<(Vec<u64>, bool), BackendError> {
     let file = File::open(trace_path)
         .map_err(|source| BackendError::Engine(format!("opening trace: {source}")))?;
     let reader = TraceReader::open(BufReader::new(file))
         .map_err(|source| BackendError::Engine(source.to_string()))?;
-    let mut seqs = Vec::new();
-    let mut multithreaded = false;
-    for record in reader {
-        let record = record.map_err(|source| BackendError::Engine(source.to_string()))?;
-        match record.event.kind {
-            EventKind::SyscallExit => seqs.push(record.seq),
-            EventKind::SchedSwitch | EventKind::ThreadSpawn | EventKind::ThreadExit => {
-                multithreaded = true;
-            }
-            _ => {}
-        }
-    }
+    let records = reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| BackendError::Engine(source.to_string()))?;
+    let seqs = records
+        .iter()
+        .filter(|record| record.event.kind == EventKind::SyscallExit)
+        .map(|record| record.seq)
+        .collect();
+    let multithreaded = replay::trace_is_multithreaded(&records);
     Ok((seqs, multithreaded))
 }
 

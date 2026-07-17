@@ -20,7 +20,11 @@ use recorder::trace::{EventKind, Record};
 /// [`EventKind::ThreadExit`]); the recorder emits these only once a second
 /// thread is followed, so a single-threaded trace scans to `false` and replays
 /// exactly as it did before this feature.
-pub(crate) fn trace_is_multithreaded(records: &[Record]) -> bool {
+///
+/// `pub` (re-exported at the crate root) so callers outside this crate — e.g.
+/// a DAP frontend deciding up front whether a trace needs schedule-aware
+/// handling — can reuse this exact predicate instead of duplicating the scan.
+pub fn trace_is_multithreaded(records: &[Record]) -> bool {
     records.iter().any(|r| {
         matches!(
             r.event.kind,
