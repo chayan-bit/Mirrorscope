@@ -223,7 +223,7 @@ fn replays_multithreaded_read_results_per_thread_without_divergence() {
         "recorded target must exit cleanly"
     );
     assert!(
-        outcome.threads_followed >= THREADS as u64 + 1,
+        outcome.threads_followed > THREADS as u64,
         "must follow main + {THREADS} workers, got {}",
         outcome.threads_followed
     );
