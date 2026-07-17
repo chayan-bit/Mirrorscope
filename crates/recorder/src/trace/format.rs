@@ -25,6 +25,21 @@ pub(crate) const CMDLINE_MIN_VERSION: u16 = 2;
 /// First format version whose record body carries a per-event thread id.
 pub(crate) const TID_MIN_VERSION: u16 = 3;
 
+/// Upper bound on a single record's declared body length, enforced by the
+/// reader *before* it allocates a buffer for it.
+///
+/// `body_len` comes off the wire as an untrusted `u32`; without a cap, a
+/// crafted or corrupt trace declaring e.g. `0xFFFF_FFFF` forces a ~4 GiB
+/// allocation before `read_exact` has any chance to fail on the short read.
+/// 16 MiB comfortably covers every body the recorder can legitimately emit:
+/// syscall payloads carry at most a handful of captured buffers (`read`,
+/// `pread64`, `recvfrom`, `getrandom`, …) and while the recorder does not
+/// itself clamp how much of a large `read`/`recvfrom` it captures, buffers
+/// that size in a *single* syscall are not a realistic recording workload —
+/// see `capture::syscall::kernel_written_region`. Anything past this bound is
+/// almost certainly a malformed or hostile trace, not a legitimate one.
+pub(crate) const MAX_BODY_LEN: usize = 16 * 1024 * 1024;
+
 /// The command line a trace was recorded from: the program plus its arguments.
 ///
 /// Stored in the variable-length header region of a v2+ trace as length-prefixed
@@ -281,6 +296,17 @@ pub enum TraceError {
     /// The stream ended in the middle of a record frame.
     #[error("trace truncated mid-record")]
     Truncated,
+    /// A record declared a body length larger than [`MAX_BODY_LEN`], the
+    /// largest body the recorder can legitimately emit. Rejected before
+    /// allocating a buffer for it, so a crafted or corrupt length can't be
+    /// used to force an oversized allocation.
+    #[error("record body length {found} exceeds the maximum of {max} bytes")]
+    BodyTooLarge {
+        /// The declared body length.
+        found: usize,
+        /// The maximum permitted body length.
+        max: usize,
+    },
     /// The header's embedded command line could not be decoded.
     #[error("malformed trace header (bad embedded command line)")]
     MalformedHeader,

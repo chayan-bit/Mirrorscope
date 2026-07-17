@@ -258,6 +258,31 @@ fn preserves_unknown_event_kinds_for_forward_compat() {
     assert_eq!(records[0].event.kind, EventKind::Unknown(0x7abc));
 }
 
+/// A crafted (or corrupt) trace declaring a huge `body_len` must be rejected
+/// *before* the reader allocates a buffer for it — not after a ~4 GiB
+/// allocation attempt. Forges a single record frame with a legitimate-looking
+/// header but a `body_len` of `0xFFFF_FFFF` and no actual body bytes behind
+/// it, proving the bound check runs ahead of the read.
+#[test]
+fn rejects_a_record_declaring_an_oversized_body_length_before_allocating() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&MAGIC);
+    bytes.extend_from_slice(&recorder::trace::FORMAT_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&12u16.to_le_bytes()); // header_len, no cmdline
+    bytes.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // forged body_len
+                                                            // Deliberately no body/crc bytes follow: if the reader tried to
+                                                            // `read_exact` that many bytes it would hit `Truncated` instead, which
+                                                            // would mask the bug this test guards against (the oversized
+                                                            // allocation itself, not merely the eventual truncation).
+
+    let reader = TraceReader::open(&bytes[..]).expect("open reader");
+    let results: Vec<_> = reader.collect();
+    assert!(
+        matches!(results.last(), Some(Err(TraceError::BodyTooLarge { .. }))),
+        "an oversized declared body length must be rejected before allocation, got {results:?}"
+    );
+}
+
 #[test]
 fn reader_rejects_non_monotonic_sequence_numbers() {
     let mut writer = TraceWriter::create(Vec::new()).expect("create writer");

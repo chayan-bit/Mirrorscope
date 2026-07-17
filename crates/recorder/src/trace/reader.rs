@@ -5,7 +5,7 @@ use std::io::Read;
 
 use super::format::{
     decode_body, decode_cmdline, min_body_len, Cmdline, Record, TraceError, BASE_HEADER_LEN,
-    CMDLINE_MIN_VERSION, FORMAT_VERSION, MAGIC,
+    CMDLINE_MIN_VERSION, FORMAT_VERSION, MAGIC, MAX_BODY_LEN,
 };
 
 /// Iterates `Result<Record, TraceError>` over an append-only trace stream.
@@ -84,6 +84,16 @@ impl<R: Read> TraceReader<R> {
         let body_len = u32::from_le_bytes(len_buf) as usize;
         if body_len < min_body_len(self.version) {
             return Err(TraceError::Truncated);
+        }
+        // Bound-check before allocating: `body_len` is untrusted input, and an
+        // unbounded `vec![0u8; body_len]` would let a crafted length (up to
+        // ~4 GiB for a u32) force a huge allocation before `read_exact` ever
+        // gets a chance to fail on the short read.
+        if body_len > MAX_BODY_LEN {
+            return Err(TraceError::BodyTooLarge {
+                found: body_len,
+                max: MAX_BODY_LEN,
+            });
         }
 
         let mut body = vec![0u8; body_len];
