@@ -103,6 +103,43 @@ impl ThreadExit {
     }
 }
 
+/// Payload of an [`EventKind::Signal`](crate::trace::EventKind) record: the
+/// raw POSIX signal number the recorder observed being delivered to the
+/// tracee at this stop (a non-`SIGSTOP` `PTRACE_EVENT_STOP`). Replay decodes
+/// this to verify the signal it is about to redeliver actually matches the
+/// recording, rather than trusting whatever the live stop reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalDelivery {
+    /// Raw signal number (e.g. `SIGSEGV` == 11).
+    pub signum: i32,
+}
+
+impl SignalDelivery {
+    /// Encode for a trace record payload.
+    pub fn encode(&self) -> Vec<u8> {
+        self.signum.to_le_bytes().to_vec()
+    }
+
+    /// Decode from a trace record payload.
+    pub fn decode(payload: &[u8]) -> Result<Self, PayloadError> {
+        Ok(Self {
+            signum: read_i32(payload, 0)?,
+        })
+    }
+}
+
+/// Read a little-endian `i32` at `offset`, erroring if the payload is short.
+fn read_i32(payload: &[u8], offset: usize) -> Result<i32, PayloadError> {
+    let end = offset + 4;
+    let slice = payload.get(offset..end).ok_or(PayloadError::TooShort {
+        found: payload.len(),
+        need: end,
+    })?;
+    Ok(i32::from_le_bytes(
+        slice.try_into().expect("length checked"),
+    ))
+}
+
 /// Read a little-endian `u32` at `offset`, erroring if the payload is short.
 fn read_u32(payload: &[u8], offset: usize) -> Result<u32, PayloadError> {
     let end = offset + 4;
@@ -270,6 +307,20 @@ mod tests {
         ));
         assert!(matches!(
             ThreadSpawn::decode(&[0u8; 5]),
+            Err(PayloadError::TooShort { .. })
+        ));
+    }
+
+    #[test]
+    fn signal_delivery_round_trips() {
+        let ev = SignalDelivery { signum: 11 }; // SIGSEGV
+        assert_eq!(SignalDelivery::decode(&ev.encode()).expect("decode"), ev);
+    }
+
+    #[test]
+    fn rejects_short_signal_payload() {
+        assert!(matches!(
+            SignalDelivery::decode(&[0u8; 2]),
             Err(PayloadError::TooShort { .. })
         ));
     }

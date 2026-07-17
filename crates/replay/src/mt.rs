@@ -42,7 +42,9 @@ use nix::sys::signal::Signal;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 
-use recorder::capture::payload::{SchedSwitch, SyscallEnter, SyscallExit, ThreadSpawn};
+use recorder::capture::payload::{
+    SchedSwitch, SignalDelivery, SyscallEnter, SyscallExit, ThreadSpawn,
+};
 use recorder::trace::{EventKind, Record};
 
 use crate::error::ReplayError;
@@ -366,6 +368,16 @@ fn on_signal(session: &mut ReplaySession, record: &Record) -> Result<(), ReplayE
             status,
         ));
     };
+    let recorded = SignalDelivery::decode(&record.event.payload)?;
+    if recorded.signum != delivered as i32 {
+        return Err(ReplayError::ScheduleDiverged {
+            seq: record.seq,
+            detail: format!(
+                "thread {tid}: expected delivered signal {}, got {}",
+                recorded.signum, delivered as i32
+            ),
+        });
+    }
     if let Some(thread) = state(session).threads.get_mut(&live) {
         thread.resume_signal = Some(delivered);
     }
